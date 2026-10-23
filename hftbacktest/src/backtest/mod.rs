@@ -1452,3 +1452,109 @@ mod ab3465_modify_is_not_an_execution {
         }
     }
 }
+
+#[cfg(test)]
+mod ab3465_through_fills_capped {
+    use crate::{
+        backtest::{
+            Backtest, DataSource, ExchangeKind, L2AssetBuilder,
+            assettype::LinearAsset,
+            data::Data,
+            models::{
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
+                TradingValueFeeModel,
+            },
+        },
+        depth::HashMapMarketDepth,
+        prelude::Bot,
+        types::*,
+    };
+
+    fn event(t: i64, ev: u64, px: f64, qty: f64) -> Event {
+        Event {
+            ev: ev | EXCH_EVENT | LOCAL_EVENT,
+            exch_ts: t,
+            local_ts: t,
+            px,
+            qty,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }
+    }
+
+    /// Book 98 / 102, our 1.0 maker order at 100 (best on its side) from t=3, then `later` events.
+    fn position_after(buy: bool, later: &[Event]) -> f64 {
+        let mut events = vec![
+            event(1, DEPTH_EVENT | BUY_EVENT, 98.0, 1.0),
+            event(2, DEPTH_EVENT | SELL_EVENT, 102.0, 1.0),
+            event(3, 0, 0.0, 0.0),
+        ];
+        events.extend_from_slice(later);
+        events.push(event(50, 0, 0.0, 0.0));
+        let asset = L2AssetBuilder::default()
+            .data(vec![DataSource::Data(Data::from_data(&events))])
+            .latency_model(ConstantLatency::new(0, 0))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(0.00004, 0.00028)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+            .exchange(ExchangeKind::PartialFillExchange)
+            .depth(|| HashMapMarketDepth::new(1.0, 0.01))
+            .build()
+            .unwrap();
+        let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
+        bt.elapse(3).unwrap();
+        if buy {
+            bt.submit_buy_order(0, 1, 100.0, 1.0, TimeInForce::GTX, OrdType::Limit, false)
+                .unwrap();
+        } else {
+            bt.submit_sell_order(0, 1, 100.0, 1.0, TimeInForce::GTX, OrdType::Limit, false)
+                .unwrap();
+        }
+        bt.elapse(50).unwrap();
+        bt.position(0)
+    }
+
+    #[test]
+    fn a_trade_through_our_price_fills_only_the_quantity_it_traded() {
+        for buy in [true, false] {
+            let (through, sign) = if buy { (99.0, 1.0) } else { (101.0, -1.0) };
+            let taker = TRADE_EVENT | if buy { SELL_EVENT } else { BUY_EVENT };
+            let pos = position_after(
+                buy,
+                &[
+                    event(10, taker, through, 0.03),
+                    event(11, taker, through, 0.05),
+                ],
+            );
+            assert!(
+                (pos - sign * 0.08).abs() < 1e-9,
+                "buy={buy}: two prints of 0.03 and 0.05 fill 0.08, got {pos}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_book_crossing_our_price_fills_only_the_crossing_quantity_once() {
+        for buy in [true, false] {
+            let (side, sign, deeper) = if buy {
+                (SELL_EVENT, 1.0, 99.0)
+            } else {
+                (BUY_EVENT, -1.0, 101.0)
+            };
+            let pos = position_after(
+                buy,
+                &[
+                    // 0.2 rests at our price: it meets our order for 0.2.
+                    event(10, DEPTH_EVENT | side, 100.0, 0.2),
+                    // 0.1 more through our price: 0.3 now crosses, 0.2 of it already filled us.
+                    event(11, DEPTH_EVENT | side, deeper, 0.1),
+                ],
+            );
+            assert!(
+                (pos - sign * 0.3).abs() < 1e-9,
+                "buy={buy}: crossing quantity 0.3 fills 0.3, got {pos}"
+            );
+        }
+    }
+}

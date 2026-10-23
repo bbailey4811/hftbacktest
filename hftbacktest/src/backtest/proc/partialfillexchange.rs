@@ -126,6 +126,9 @@ where
     own_fill_depletion_persists: bool,
     consumed_bid: HashMap<i64, f64>,
     consumed_ask: HashMap<i64, f64>,
+    // AB#3465 (gentilly): what each resting order has already been filled from the opposite book crossing its
+    // price, so a later best-price update fills it only from crossing quantity it has not already taken.
+    cross_taken: HashMap<OrderId, f64>,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -156,6 +159,7 @@ where
             own_fill_depletion_persists: false,
             consumed_bid: Default::default(),
             consumed_ask: Default::default(),
+            cross_taken: Default::default(),
         }
     }
 
@@ -188,14 +192,15 @@ where
         match order.price_tick.cmp(&price_tick) {
             Ordering::Greater => {}
             Ordering::Less => {
-                self.filled_orders.push(order.order_id);
-                return self.fill::<true>(
-                    order,
-                    timestamp,
-                    true,
-                    order.price_tick,
-                    order.leaves_qty,
-                );
+                // AB#3465 (gentilly): a trade through our price is a taker who would have met our order first, for
+                // the quantity it traded and no more. Filling the whole order from one small print overstates
+                // maker volume many times over.
+                let exec_qty = qty.min(order.leaves_qty);
+                self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty)?;
+                if order.status == Status::Filled {
+                    self.filled_orders.push(order.order_id);
+                }
+                return Ok(());
             }
             Ordering::Equal => {
                 // Updates the order's queue position.
@@ -228,14 +233,15 @@ where
     ) -> Result<(), BacktestError> {
         match order.price_tick.cmp(&price_tick) {
             Ordering::Greater => {
-                self.filled_orders.push(order.order_id);
-                return self.fill::<true>(
-                    order,
-                    timestamp,
-                    true,
-                    order.price_tick,
-                    order.leaves_qty,
-                );
+                // AB#3465 (gentilly): a trade through our price is a taker who would have met our order first, for
+                // the quantity it traded and no more. Filling the whole order from one small print overstates
+                // maker volume many times over.
+                let exec_qty = qty.min(order.leaves_qty);
+                self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty)?;
+                if order.status == Status::Filled {
+                    self.filled_orders.push(order.order_id);
+                }
+                return Ok(());
             }
             Ordering::Less => {}
             Ordering::Equal => {
@@ -299,10 +305,32 @@ where
         Ok(())
     }
 
+    /// AB#3465 (gentilly): the opposite book now displays resting quantity at or through our order's price. Those are
+    /// orders that would have met ours, for their quantity and no more, so our order fills from the crossing quantity
+    /// (`lo..=hi`) it has not already been filled from, never its whole remainder at once.
+    fn cross_fill_qty(
+        &mut self,
+        order_id: OrderId,
+        leaves_qty: f64,
+        lo: i64,
+        hi: i64,
+        level_qty: impl Fn(&MD, i64) -> f64,
+    ) -> f64 {
+        let crossing: f64 = (lo..=hi).map(|t| level_qty(&self.depth, t)).sum();
+        let taken = self.cross_taken.entry(order_id).or_insert(0.0);
+        let exec_qty = (crossing - *taken).max(0.0).min(leaves_qty);
+        if (exec_qty / self.depth.lot_size()).round() <= 0.0 {
+            return 0.0;
+        }
+        *taken += exec_qty;
+        exec_qty
+    }
+
     fn remove_filled_orders(&mut self) {
         if !self.filled_orders.is_empty() {
             let mut orders = self.orders.borrow_mut();
             for order_id in self.filled_orders.drain(..) {
+                self.cross_taken.remove(&order_id);
                 let order = orders.remove(&order_id).unwrap();
                 if order.side == Side::Buy {
                     self.buy_orders
@@ -343,45 +371,31 @@ where
         }
     }
 
+    // AB#3465 (gentilly): a crossed order may keep a remainder resting at a price the opposite best has already
+    // passed, so every resting order on the crossed side is checked, not only the ticks the best just moved over.
     fn on_best_bid_update(
         &mut self,
-        prev_best_tick: i64,
+        _prev_best_tick: i64,
         new_best_tick: i64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
-        // If the best has been significantly updated compared to the previous best, it would be
-        // better to iterate orders dict instead of order price ladder.
         {
             let orders = self.orders.clone();
             let mut orders_borrowed = orders.borrow_mut();
-            if prev_best_tick == INVALID_MIN
-                || (orders_borrowed.len() as i64) < new_best_tick - prev_best_tick
-            {
-                for (_, order) in orders_borrowed.iter_mut() {
-                    if order.side == Side::Sell && order.price_tick <= new_best_tick {
-                        self.filled_orders.push(order.order_id);
-                        self.fill::<true>(
-                            order,
-                            timestamp,
-                            true,
-                            order.price_tick,
-                            order.leaves_qty,
-                        )?;
-                    }
-                }
-            } else {
-                for t in (prev_best_tick + 1)..=new_best_tick {
-                    if let Some(order_ids) = self.sell_orders.get(&t) {
-                        for order_id in order_ids.clone().iter() {
-                            self.filled_orders.push(*order_id);
-                            let order = orders_borrowed.get_mut(order_id).unwrap();
-                            self.fill::<true>(
-                                order,
-                                timestamp,
-                                true,
-                                order.price_tick,
-                                order.leaves_qty,
-                            )?;
+            for (_, order) in orders_borrowed.iter_mut() {
+                if order.side == Side::Sell && order.price_tick <= new_best_tick {
+                    let oid = order.order_id;
+                    let exec_qty = self.cross_fill_qty(
+                        oid,
+                        order.leaves_qty,
+                        order.price_tick,
+                        new_best_tick,
+                        |depth, t| depth.bid_qty_at_tick(t),
+                    );
+                    if exec_qty > 0.0 {
+                        self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty)?;
+                        if order.status == Status::Filled {
+                            self.filled_orders.push(oid);
                         }
                     }
                 }
@@ -393,43 +407,27 @@ where
 
     fn on_best_ask_update(
         &mut self,
-        prev_best_tick: i64,
+        _prev_best_tick: i64,
         new_best_tick: i64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
-        // If the best has been significantly updated compared to the previous best, it would be
-        // better to iterate orders dict instead of order price ladder.
         {
             let orders = self.orders.clone();
             let mut orders_borrowed = orders.borrow_mut();
-            if prev_best_tick == INVALID_MAX
-                || (orders_borrowed.len() as i64) < prev_best_tick - new_best_tick
-            {
-                for (_, order) in orders_borrowed.iter_mut() {
-                    if order.side == Side::Buy && order.price_tick >= new_best_tick {
-                        self.filled_orders.push(order.order_id);
-                        self.fill::<true>(
-                            order,
-                            timestamp,
-                            true,
-                            order.price_tick,
-                            order.leaves_qty,
-                        )?;
-                    }
-                }
-            } else {
-                for t in new_best_tick..prev_best_tick {
-                    if let Some(order_ids) = self.buy_orders.get(&t) {
-                        for order_id in order_ids.clone().iter() {
-                            self.filled_orders.push(*order_id);
-                            let order = orders_borrowed.get_mut(order_id).unwrap();
-                            self.fill::<true>(
-                                order,
-                                timestamp,
-                                true,
-                                order.price_tick,
-                                order.leaves_qty,
-                            )?;
+            for (_, order) in orders_borrowed.iter_mut() {
+                if order.side == Side::Buy && order.price_tick >= new_best_tick {
+                    let oid = order.order_id;
+                    let exec_qty = self.cross_fill_qty(
+                        oid,
+                        order.leaves_qty,
+                        new_best_tick,
+                        order.price_tick,
+                        |depth, t| depth.ask_qty_at_tick(t),
+                    );
+                    if exec_qty > 0.0 {
+                        self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty)?;
+                        if order.status == Status::Filled {
+                            self.filled_orders.push(oid);
                         }
                     }
                 }
@@ -758,6 +756,7 @@ where
                 .unwrap()
                 .remove(&order.order_id);
         }
+        self.cross_taken.remove(&order.order_id);
         order.status = Status::Canceled;
         order.exch_timestamp = timestamp;
         Ok(())
