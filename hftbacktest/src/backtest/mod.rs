@@ -1724,3 +1724,212 @@ mod ab3465_review_cases {
         assert!(near(p, -0.2), "control got {p}");
     }
 }
+
+#[cfg(test)]
+mod ab3465_review2_cases {
+    use crate::{
+        backtest::{
+            Backtest, DataSource, ExchangeKind, L2AssetBuilder,
+            assettype::LinearAsset,
+            data::Data,
+            models::{
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
+                TradingValueFeeModel,
+            },
+        },
+        depth::HashMapMarketDepth,
+        prelude::Bot,
+        types::*,
+    };
+
+    fn ev(t: i64, e: u64, px: f64, qty: f64) -> Event {
+        Event { ev: e | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival: 0, fval: 0.0 }
+    }
+    fn bid(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | BUY_EVENT, px, q) }
+    fn ask(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | SELL_EVENT, px, q) }
+    fn buy_trade(t: i64, px: f64, q: f64) -> Event { ev(t, TRADE_EVENT | BUY_EVENT, px, q) }
+
+    type Ord_ = (u64, bool, f64, f64, TimeInForce, i64); // id, buy, px, qty, tif, submit time
+
+    fn run(pre: &[Event], orders: &[Ord_], later: &[Event], depletion: bool) -> (f64, usize) {
+        let mut events = vec![bid(1, 98.0, 1.0), ask(1, 102.0, 1.0)];
+        events.extend_from_slice(pre);
+        events.push(ev(3, 0, 0.0, 0.0));
+        events.extend_from_slice(later);
+        events.push(ev(100, 0, 0.0, 0.0));
+        events.sort_by_key(|e| e.exch_ts);
+        let asset = L2AssetBuilder::default()
+            .data(vec![DataSource::Data(Data::from_data(&events))])
+            .latency_model(ConstantLatency::new(0, 0))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(0.00004, 0.00028)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+            .exchange(ExchangeKind::PartialFillExchange)
+            .own_fill_depletion(depletion)
+            .depth(|| HashMapMarketDepth::new(1.0, 0.01))
+            .build()
+            .unwrap();
+        let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
+        let mut now = 0;
+        let mut os = orders.to_vec();
+        os.sort_by_key(|o| o.5);
+        for (id, b, px, q, tif, t) in os {
+            if t > now { bt.elapse(t - now).unwrap(); now = t; }
+            if b {
+                bt.submit_buy_order(0, id, px, q, tif, OrdType::Limit, false).unwrap();
+            } else {
+                bt.submit_sell_order(0, id, px, q, tif, OrdType::Limit, false).unwrap();
+            }
+        }
+        bt.elapse(100 - now).unwrap();
+        let open = bt.orders(0).values().filter(|o| o.active()).count();
+        (bt.position(0), open)
+    }
+    fn near(a: f64, b: f64) -> bool { (a - b).abs() < 1e-9 }
+
+    // N1: two of our orders at the print price each get the whole remaining budget through the queue model.
+    #[test]
+    fn n1_equal_price_budget_shared() {
+        let (p, _) = run(
+            &[ask(2, 100.0, 0.3)],
+            &[(1, false, 100.0, 1.0, TimeInForce::GTX, 3), (2, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[buy_trade(10, 100.0, 0.8)],
+            false,
+        );
+        assert!(near(p, -0.5), "0.8 print, 0.3 real ahead: 0.5 left for our two orders; got {p}");
+    }
+    // N1 control: one order through + one at print price share the budget (expected pass).
+    #[test]
+    fn n1b_through_then_equal() {
+        let (p, _) = run(
+            &[ask(2, 100.0, 0.3)],
+            &[(1, false, 99.0, 0.4, TimeInForce::GTX, 3), (2, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[buy_trade(10, 100.0, 0.8)],
+            false,
+        );
+        assert!(near(p, -0.5), "got {p}");
+    }
+
+    // N2: a crossing level used before a depth clear and absent from the snapshot keeps its used qty forever.
+    #[test]
+    fn n2_clear_then_level_absent_then_new_liquidity() {
+        let (p, _) = run(
+            &[],
+            &[(1, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[
+                bid(10, 101.0, 0.2),
+                ev(11, DEPTH_CLEAR_EVENT | BUY_EVENT, 0.0, 0.0),
+                ev(12, DEPTH_SNAPSHOT_EVENT | BUY_EVENT, 98.0, 1.0),
+                bid(20, 101.0, 0.2),
+            ],
+            false,
+        );
+        assert!(near(p, -0.4), "new 0.2 at 101 after the old one vanished in the snapshot should fill; got {p}");
+    }
+    // N2 control: clear + snapshot re-sending the same level must not refill (expected pass).
+    #[test]
+    fn n2b_clear_resend_same() {
+        let (p, _) = run(
+            &[],
+            &[(1, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[
+                bid(10, 101.0, 0.2),
+                ev(11, DEPTH_CLEAR_EVENT | BUY_EVENT, 0.0, 0.0),
+                ev(12, DEPTH_SNAPSHOT_EVENT | BUY_EVENT, 98.0, 1.0),
+                ev(12, DEPTH_SNAPSHOT_EVENT | BUY_EVENT, 101.0, 0.2),
+            ],
+            false,
+        );
+        assert!(near(p, -0.2), "got {p}");
+    }
+
+    // N3: our crossed maker and our own IOC both take the same displayed crossing quantity.
+    #[test]
+    fn n3_ioc_and_crossed_maker_share_level() {
+        for depletion in [true, false] {
+            let (p, _) = run(
+                &[],
+                &[(1, true, 100.0, 1.0, TimeInForce::GTX, 3), (2, true, 99.0, 0.2, TimeInForce::IOC, 20)],
+                &[ask(10, 99.0, 0.2)],
+                depletion,
+            );
+            assert!(near(p, 0.2), "depletion={depletion}: 0.2 displayed at 99 fills 0.2 across our orders; got {p}");
+        }
+    }
+    #[test]
+    fn n3b_ioc_first_then_maker() {
+        // IOC takes 0.2 at 99 at t=10 while our maker bid rests at 98.?; the maker is then crossed by an unrelated update.
+        let (p, _) = run(
+            &[ask(2, 99.0, 0.2)],
+            &[(2, true, 99.0, 0.2, TimeInForce::IOC, 3), (1, true, 98.0, 1.0, TimeInForce::GTX, 3)],
+            &[ask(10, 98.0, 0.1)],
+            true,
+        );
+        // maker at 98 crossed by 98(0.1) only; 99 is above our price
+        assert!(near(p, 0.3), "got {p}");
+    }
+}
+
+#[cfg(test)]
+mod ab3465_crossing_bench {
+    use crate::{
+        backtest::{
+            Backtest, DataSource, ExchangeKind, L2AssetBuilder,
+            assettype::LinearAsset,
+            data::Data,
+            models::{CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel, TradingValueFeeModel},
+        },
+        depth::HashMapMarketDepth,
+        prelude::Bot,
+        types::*,
+    };
+    fn ev(t: i64, e: u64, px: f64, qty: f64) -> Event {
+        Event { ev: e | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival: 0, fval: 0.0 }
+    }
+    fn bench(n_distinct: u64, crossed: bool) {
+        let m = 300_000i64;
+        let mut events = vec![ev(1, DEPTH_EVENT | BUY_EVENT, 98.0, 1.0), ev(1, DEPTH_EVENT | SELL_EVENT, 102.0, 1.0), ev(3, 0, 0.0, 0.0), ev(4, 0, 0.0, 0.0), ev(5, 0, 0.0, 0.0)];
+        if crossed {
+            // our 1000.0 sell at 100 gets crossed by a bid far above, leaving a big remainder resting crossed
+            events.push(ev(6, DEPTH_EVENT | BUY_EVENT, 100.0 + 500.0, 0.01));
+        }
+        for i in 0..m {
+            events.push(ev(10 + i, DEPTH_EVENT | BUY_EVENT, 97.0 - (i % 50) as f64, 1.0 + (i % 7) as f64));
+        }
+        events.push(ev(10 + m + 1, 0, 0.0, 0.0));
+        let asset = L2AssetBuilder::default()
+            .data(vec![DataSource::Data(Data::from_data(&events))])
+            .latency_model(ConstantLatency::new(0, 0))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+            .exchange(ExchangeKind::PartialFillExchange)
+            .depth(|| HashMapMarketDepth::new(1.0, 0.01))
+            .build()
+            .unwrap();
+        let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
+        bt.elapse(3).unwrap();
+        for i in 0..n_distinct {
+            bt.submit_sell_order(0, i + 10, 200.0 + i as f64, 0.01, TimeInForce::GTX, OrdType::Limit, false).unwrap();
+        }
+        if crossed {
+            bt.submit_sell_order(0, 1, 100.0, 1000.0, TimeInForce::GTX, OrdType::Limit, false).unwrap();
+        }
+        bt.elapse(1).unwrap();
+        for i in 0..n_distinct {
+            bt.cancel(0, i + 10, false).unwrap();
+        }
+        bt.elapse(1).unwrap();
+        let t0 = std::time::Instant::now();
+        bt.elapse(m + 100).unwrap();
+        println!("BENCH n_distinct={n_distinct} crossed={crossed}: {} bid events in {:?} pos={} ts={} open={}", m, t0.elapsed(), bt.position(0), bt.current_timestamp(), bt.orders(0).len());
+    }
+    #[test]
+    #[ignore]
+    fn bench_depth_events() {
+        bench(0, false);
+        bench(2000, false);
+        bench(20000, false);
+        bench(0, true);
+    }
+}

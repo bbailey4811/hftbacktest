@@ -23,6 +23,9 @@ use crate::{
     },
 };
 
+/// AB#3465 (gentilly): how many ticks past the opposite best a crossed resting order is matched against.
+const MAX_CROSS_LEVELS: i64 = 1_000;
+
 /// Applies a feed update of one price level to what our own taker fills took from it. `level_qty` is the quantity
 /// the depth holds at the level after the update (zero once the depth has dropped the level). Without `persists`
 /// the feed update makes the level whole again. With it, what we took stays taken, capped at the quantity the level
@@ -130,6 +133,11 @@ where
     // displays and forgotten when it empties, so the same displayed quantity fills our orders only once.
     crossed_bid: HashMap<i64, f64>,
     crossed_ask: HashMap<i64, f64>,
+    // A depth clear keeps those, so the rebuild re-sending a level does not fill us again. The rebuild is the
+    // snapshot events and the depth events stamped like the first one after the clear; the first later depth event
+    // of that side drops the levels the rebuilt book no longer displays. `Some(None)`: cleared, rebuild not begun.
+    bid_rebuild: Option<Option<i64>>,
+    ask_rebuild: Option<Option<i64>>,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -162,6 +170,8 @@ where
             consumed_ask: Default::default(),
             crossed_bid: Default::default(),
             crossed_ask: Default::default(),
+            bid_rebuild: None,
+            ask_rebuild: None,
         }
     }
 
@@ -244,6 +254,7 @@ where
                     // executable quantity of this order after execution in the queue ahead of this
                     // order.
                     let exec_qty = filled_qty.min(order.leaves_qty);
+                    budget -= exec_qty;
                     self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty)?;
                 }
             }
@@ -262,43 +273,29 @@ where
     /// `side`. Each crossing level fills them, best price first, from the quantity it displays that has not already
     /// filled them, visiting levels from the most aggressive one down.
     fn match_crossing(&mut self, side: Side, timestamp: i64) -> Result<(), BacktestError> {
-        let (best, worst_ours) = if side == Side::Sell {
-            let worst = self
-                .sell_orders
-                .iter()
-                .filter(|(_, ids)| !ids.is_empty())
-                .map(|(t, _)| *t)
-                .min();
-            (self.depth.best_bid_tick(), worst)
+        let best = if side == Side::Sell {
+            self.depth.best_bid_tick()
         } else {
-            let worst = self
-                .buy_orders
-                .iter()
-                .filter(|(_, ids)| !ids.is_empty())
-                .map(|(t, _)| *t)
-                .max();
-            (self.depth.best_ask_tick(), worst)
+            self.depth.best_ask_tick()
         };
-        let Some(ours) = worst_ours else {
-            return Ok(());
-        };
-        let crossed = if side == Side::Sell {
-            best != INVALID_MIN && ours <= best
-        } else {
-            best != INVALID_MAX && ours >= best
-        };
-        if !crossed {
+        if best == INVALID_MIN || best == INVALID_MAX {
             return Ok(());
         }
-        // Crossing levels, most aggressive first.
-        let levels: Vec<i64> = if side == Side::Sell {
-            (ours..=best).rev().collect()
-        } else {
-            (best..=ours).collect()
+        // Our orders the opposite best has reached, best price first.
+        let crossed = self.orders_met_by_trade(side, best);
+        let Some(&(deepest, _)) = crossed.last() else {
+            return Ok(());
         };
+        // Crossing levels, most aggressive first, from the opposite best to our deepest crossed order. The walk is
+        // bounded: a remainder crossed further than MAX_CROSS_LEVELS ticks fills only from the nearest levels.
+        let span = (best - deepest).abs().min(MAX_CROSS_LEVELS);
         let orders = self.orders.clone();
-        let mut orders_borrowed = orders.borrow_mut();
-        for level in levels {
+        for step in 0..=span {
+            let level = if side == Side::Sell {
+                best - step
+            } else {
+                best + step
+            };
             let displayed = if side == Side::Sell {
                 self.depth.bid_qty_at_tick(level)
             } else {
@@ -307,35 +304,57 @@ where
             if displayed <= 0.0 {
                 continue;
             }
-            let used = if side == Side::Sell {
+            let used_map = if side == Side::Sell {
                 &self.crossed_bid
             } else {
                 &self.crossed_ask
             };
-            let mut available = displayed - used.get(&level).copied().unwrap_or(0.0);
+            let mut available = displayed - used_map.get(&level).copied().unwrap_or(0.0);
+            if self.own_fill_depletion {
+                // Displayed quantity our own IOC orders already took cannot meet our resting orders too.
+                let consumed = if side == Side::Sell {
+                    &self.consumed_bid
+                } else {
+                    &self.consumed_ask
+                };
+                available -= consumed.get(&level).copied().unwrap_or(0.0);
+            }
+            let mut used_now = 0.0;
             // A bid at `level` meets our sells priced at or below it; an ask meets our buys at or above it.
-            for (_, order_id) in self.orders_met_by_trade(side, level) {
-                let order = orders_borrowed.get_mut(&order_id).unwrap();
+            let mut orders_borrowed = orders.borrow_mut();
+            for &(tick, order_id) in &crossed {
+                let meets = if side == Side::Sell {
+                    tick <= level
+                } else {
+                    tick >= level
+                };
+                let Some(order) = orders_borrowed.get_mut(&order_id) else {
+                    continue;
+                };
+                if !meets || order.status == Status::Filled {
+                    continue;
+                }
                 let exec_qty = available.min(order.leaves_qty);
                 if (exec_qty / self.depth.lot_size()).round() <= 0.0 {
                     break;
                 }
                 available -= exec_qty;
-                let used = if side == Side::Sell {
-                    &mut self.crossed_bid
-                } else {
-                    &mut self.crossed_ask
-                };
-                *used.entry(level).or_insert(0.0) += exec_qty;
+                used_now += exec_qty;
                 self.fill::<true>(order, timestamp, true, order.price_tick, exec_qty)?;
                 if order.status == Status::Filled {
                     self.filled_orders.push(order_id);
                 }
             }
-            drop(orders_borrowed);
-            self.remove_filled_orders();
-            orders_borrowed = orders.borrow_mut();
+            if used_now > 0.0 {
+                let used_map = if side == Side::Sell {
+                    &mut self.crossed_bid
+                } else {
+                    &mut self.crossed_ask
+                };
+                *used_map.entry(level).or_insert(0.0) += used_now;
+            }
         }
+        self.remove_filled_orders();
         Ok(())
     }
 
@@ -378,22 +397,28 @@ where
         Ok(())
     }
 
+    /// Removes an order id from its side's price ladder, and the price from the ladder once no order rests there
+    /// (AB#3465: the ladders are scanned on every event, so they must hold only prices with resting orders).
+    fn unladder(&mut self, side: Side, price_tick: i64, order_id: OrderId) {
+        let ladder = if side == Side::Buy {
+            &mut self.buy_orders
+        } else {
+            &mut self.sell_orders
+        };
+        let ids = ladder.get_mut(&price_tick).unwrap();
+        ids.remove(&order_id);
+        if ids.is_empty() {
+            ladder.remove(&price_tick);
+        }
+    }
+
     fn remove_filled_orders(&mut self) {
         if !self.filled_orders.is_empty() {
-            let mut orders = self.orders.borrow_mut();
-            for order_id in self.filled_orders.drain(..) {
+            let orders = self.orders.clone();
+            let mut orders = orders.borrow_mut();
+            for order_id in std::mem::take(&mut self.filled_orders) {
                 let order = orders.remove(&order_id).unwrap();
-                if order.side == Side::Buy {
-                    self.buy_orders
-                        .get_mut(&order.price_tick)
-                        .unwrap()
-                        .remove(&order_id);
-                } else {
-                    self.sell_orders
-                        .get_mut(&order.price_tick)
-                        .unwrap()
-                        .remove(&order_id);
-                }
+                self.unladder(order.side, order.price_tick, order_id);
             }
         }
     }
@@ -478,7 +503,10 @@ where
                             TimeInForce::IOC => {
                                 // The order must be executed immediately.
                                 for t in self.depth.best_ask_tick()..=order.price_tick {
-                                    let mut qty = self.depth.ask_qty_at_tick(t);
+                                    // AB#3465 (gentilly): displayed quantity our crossed resting orders already
+                                    // took is gone for our IOC orders too.
+                                    let mut qty = self.depth.ask_qty_at_tick(t)
+                                        - self.crossed_ask.get(&t).copied().unwrap_or(0.0);
                                     if self.own_fill_depletion {
                                         qty = own_fill_available(
                                             qty,
@@ -617,7 +645,10 @@ where
                             TimeInForce::IOC => {
                                 // The order must be executed immediately.
                                 for t in (order.price_tick..=self.depth.best_bid_tick()).rev() {
-                                    let mut qty = self.depth.bid_qty_at_tick(t);
+                                    // AB#3465 (gentilly): displayed quantity our crossed resting orders already
+                                    // took is gone for our IOC orders too.
+                                    let mut qty = self.depth.bid_qty_at_tick(t)
+                                        - self.crossed_bid.get(&t).copied().unwrap_or(0.0);
                                     if self.own_fill_depletion {
                                         qty = own_fill_available(
                                             qty,
@@ -730,17 +761,7 @@ where
         let _ = std::mem::replace(order, exch_order);
 
         // Deletes the order.
-        if order.side == Side::Buy {
-            self.buy_orders
-                .get_mut(&order.price_tick)
-                .unwrap()
-                .remove(&order.order_id);
-        } else {
-            self.sell_orders
-                .get_mut(&order.price_tick)
-                .unwrap()
-                .remove(&order.order_id);
-        }
+        self.unladder(order.side, order.price_tick, order.order_id);
         order.status = Status::Canceled;
         order.exch_timestamp = timestamp;
         Ok(())
@@ -811,14 +832,30 @@ where
         if event.is(EXCH_BID_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::Buy, event.px);
             self.consumed_bid.clear();
+            self.bid_rebuild = Some(None);
         } else if event.is(EXCH_ASK_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::Sell, event.px);
             self.consumed_ask.clear();
+            self.ask_rebuild = Some(None);
         } else if event.is(EXCH_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::None, 0.0);
             self.consumed_bid.clear();
             self.consumed_ask.clear();
+            self.bid_rebuild = Some(None);
+            self.ask_rebuild = Some(None);
         } else if event.is(EXCH_BID_DEPTH_EVENT) || event.is(EXCH_BID_DEPTH_SNAPSHOT_EVENT) {
+            match self.bid_rebuild {
+                Some(None) => self.bid_rebuild = Some(Some(event.exch_ts)),
+                Some(Some(rebuild_ts))
+                    if event.exch_ts > rebuild_ts && !event.is(EXCH_BID_DEPTH_SNAPSHOT_EVENT) =>
+                {
+                    let depth = &self.depth;
+                    self.crossed_bid
+                        .retain(|tick, _| depth.bid_qty_at_tick(*tick) > 0.0);
+                    self.bid_rebuild = None;
+                }
+                _ => {}
+            }
             let (price_tick, _prev_best_bid_tick, _best_bid_tick, prev_qty, new_qty, timestamp) =
                 self.depth
                     .update_bid_depth(event.px, event.qty, event.exch_ts);
@@ -837,6 +874,18 @@ where
             );
             self.match_crossing(Side::Sell, timestamp)?;
         } else if event.is(EXCH_ASK_DEPTH_EVENT) || event.is(EXCH_ASK_DEPTH_SNAPSHOT_EVENT) {
+            match self.ask_rebuild {
+                Some(None) => self.ask_rebuild = Some(Some(event.exch_ts)),
+                Some(Some(rebuild_ts))
+                    if event.exch_ts > rebuild_ts && !event.is(EXCH_ASK_DEPTH_SNAPSHOT_EVENT) =>
+                {
+                    let depth = &self.depth;
+                    self.crossed_ask
+                        .retain(|tick, _| depth.ask_qty_at_tick(*tick) > 0.0);
+                    self.ask_rebuild = None;
+                }
+                _ => {}
+            }
             let (price_tick, _prev_best_ask_tick, _best_ask_tick, prev_qty, new_qty, timestamp) =
                 self.depth
                     .update_ask_depth(event.px, event.qty, event.exch_ts);
