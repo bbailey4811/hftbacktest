@@ -1933,3 +1933,169 @@ mod ab3465_crossing_bench {
         bench(0, true);
     }
 }
+
+#[cfg(test)]
+mod ab3465_review3_cases {
+    use crate::{
+        backtest::{
+            Backtest, DataSource, ExchangeKind, L2AssetBuilder,
+            assettype::LinearAsset,
+            data::Data,
+            models::{CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel, TradingValueFeeModel},
+        },
+        depth::HashMapMarketDepth,
+        prelude::Bot,
+        types::*,
+    };
+
+    fn ev(t: i64, e: u64, px: f64, qty: f64) -> Event {
+        Event { ev: e | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival: 0, fval: 0.0 }
+    }
+    fn bid(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | BUY_EVENT, px, q) }
+    fn ask(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | SELL_EVENT, px, q) }
+
+    type O = (u64, bool, f64, f64, TimeInForce, i64);
+
+    /// returns (position, open orders, num_trades)
+    fn run(pre: &[Event], orders: &[O], later: &[Event], depletion: bool) -> (f64, usize, i64) {
+        let mut events = vec![bid(1, 98.0, 1.0), ask(1, 102.0, 1.0)];
+        events.extend_from_slice(pre);
+        events.push(ev(3, 0, 0.0, 0.0));
+        events.extend_from_slice(later);
+        events.push(ev(100, 0, 0.0, 0.0));
+        events.sort_by_key(|e| e.exch_ts);
+        let asset = L2AssetBuilder::default()
+            .data(vec![DataSource::Data(Data::from_data(&events))])
+            .latency_model(ConstantLatency::new(0, 0))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(0.00004, 0.00028)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+            .exchange(ExchangeKind::PartialFillExchange)
+            .own_fill_depletion(depletion)
+            .depth(|| HashMapMarketDepth::new(1.0, 0.01))
+            .build()
+            .unwrap();
+        let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
+        let mut now = 0;
+        let mut os = orders.to_vec();
+        os.sort_by_key(|o| o.5);
+        for (id, b, px, q, tif, t) in os {
+            if t > now { bt.elapse(t - now).unwrap(); now = t; }
+            if b {
+                bt.submit_buy_order(0, id, px, q, tif, OrdType::Limit, false).unwrap();
+            } else {
+                bt.submit_sell_order(0, id, px, q, tif, OrdType::Limit, false).unwrap();
+            }
+        }
+        bt.elapse(100 - now).unwrap();
+        let open = bt.orders(0).values().filter(|o| o.active()).count();
+        for o in bt.orders(0).values() { println!("DBG id={} st={:?} leaves={:e} exec={:e} maker={}", o.order_id, o.status, o.leaves_qty, o.exec_qty, o.maker); }
+        println!("DBG pos={:e} n={}", bt.position(0), bt.state_values(0).num_trades);
+        (bt.position(0), open, bt.state_values(0).num_trades)
+    }
+    fn near(a: f64, b: f64) -> bool { (a - b).abs() < 1e-9 }
+
+    // F1: the crossing walk stops at our LEAST crossed order, so deeper levels that cross only our more aggressive
+    // order are never visited.
+    #[test]
+    fn f1_walk_reaches_the_most_crossed_order() {
+        let (p, _, _) = run(
+            &[],
+            &[(1, false, 99.0, 1.0, TimeInForce::GTX, 3), (2, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[bid(10, 101.0, 0.2), bid(11, 99.0, 0.5)],
+            false,
+        );
+        // 101(0.2) fills our 99 first; the new bid at 99 (0.5) crosses our 99 ask for 0.5 more
+        assert!(near(p, -0.7), "got {p}");
+    }
+    #[test]
+    fn f1b_buy_mirror() {
+        let (p, _, _) = run(
+            &[],
+            &[(1, true, 101.0, 1.0, TimeInForce::GTX, 3), (2, true, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[ask(10, 99.0, 0.2), ask(11, 101.0, 0.5)],
+            false,
+        );
+        assert!(near(p, 0.7), "got {p}");
+    }
+
+    // F2: IOC walks displayed - crossed with no lot guard: float residue becomes a dust fill.
+    #[test]
+    fn f2_ioc_dust_fill_from_crossed_residue() {
+        let (p, _, n) = run(
+            &[],
+            &[(1, true, 100.0, 1.0, TimeInForce::GTX, 3), (2, true, 99.0, 0.5, TimeInForce::IOC, 20)],
+            &[ask(10, 99.0, 0.05), ask(11, 99.0, 0.21)],
+            false,
+        );
+        // maker takes 0.05 then 0.16 = all 0.21 displayed; the IOC finds nothing
+        assert!(near(p, 0.21) && n == 2, "pos={p} num_trades={n} (expected 2 maker fills, no IOC fill)");
+    }
+
+    // F3: Lighter live-book style resync: EXCH_DEPTH_CLEAR then plain depth events at the same ts
+    // (asks first, then bids ascending), used level re-sent must not refill; later ticker at later ts.
+    #[test]
+    fn f3_lighter_style_resync_no_refill() {
+        let (p, _, _) = run(
+            &[],
+            &[(1, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[
+                bid(10, 101.0, 0.2),
+                ev(20, DEPTH_CLEAR_EVENT, 0.0, 0.0),
+                ask(20, 102.0, 1.0),
+                bid(20, 98.0, 1.0),
+                bid(20, 101.0, 0.2),
+                bid(30, 97.0, 1.0),
+            ],
+            false,
+        );
+        assert!(near(p, -0.2), "got {p}");
+    }
+    #[test]
+    fn f3b_resync_absent_then_new() {
+        let (p, _, _) = run(
+            &[],
+            &[(1, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[
+                bid(10, 101.0, 0.2),
+                ev(20, DEPTH_CLEAR_EVENT, 0.0, 0.0),
+                ask(20, 102.0, 1.0),
+                bid(20, 98.0, 1.0),
+                bid(30, 97.0, 1.0),
+                bid(40, 101.0, 0.2),
+            ],
+            false,
+        );
+        assert!(near(p, -0.4), "got {p}");
+    }
+    // F3c: resync re-sends the level at the same ts but the first event after the clear is on the other side only.
+    #[test]
+    fn f3c_resync_then_immediate_change_same_ts() {
+        // A real delta at the resync ts that removes 101 and re-adds it at a later ts: must fill again.
+        let (p, _, _) = run(
+            &[],
+            &[(1, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[
+                bid(10, 101.0, 0.2),
+                ev(20, DEPTH_CLEAR_EVENT, 0.0, 0.0),
+                bid(20, 98.0, 1.0),
+                bid(25, 101.0, 0.2),
+            ],
+            false,
+        );
+        // 101 was absent from the resync; a new 0.2 at t=25 is new liquidity
+        assert!(near(p, -0.4), "got {p}");
+    }
+
+    // F4: modify (cancel+new at a new price) and partial fill/cancel keep the ladders consistent: no panic.
+    #[test]
+    fn f4_cancel_after_partial_and_trade() {
+        let (p, open, _) = run(
+            &[],
+            &[(1, false, 100.0, 1.0, TimeInForce::GTX, 3), (2, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[bid(10, 101.0, 0.5), bid(11, 101.0, 1.8), ev(12, TRADE_EVENT | BUY_EVENT, 103.0, 0.5)],
+            false,
+        );
+        assert!(near(p, -2.0) && open == 0, "got {p} open={open}");
+    }
+}

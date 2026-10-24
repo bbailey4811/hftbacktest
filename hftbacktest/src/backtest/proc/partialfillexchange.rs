@@ -283,7 +283,8 @@ where
         }
         // Our orders the opposite best has reached, best price first.
         let crossed = self.orders_met_by_trade(side, best);
-        let Some(&(deepest, _)) = crossed.last() else {
+        // Best price first: the first is our most crossed order.
+        let Some(&(deepest, _)) = crossed.first() else {
             return Ok(());
         };
         // Crossing levels, most aggressive first, from the opposite best to our deepest crossed order. The walk is
@@ -507,6 +508,9 @@ where
                                     // took is gone for our IOC orders too.
                                     let mut qty = self.depth.ask_qty_at_tick(t)
                                         - self.crossed_ask.get(&t).copied().unwrap_or(0.0);
+                                    if (qty / self.depth.lot_size()).round() <= 0.0 {
+                                        qty = 0.0;
+                                    }
                                     if self.own_fill_depletion {
                                         qty = own_fill_available(
                                             qty,
@@ -649,6 +653,9 @@ where
                                     // took is gone for our IOC orders too.
                                     let mut qty = self.depth.bid_qty_at_tick(t)
                                         - self.crossed_bid.get(&t).copied().unwrap_or(0.0);
+                                    if (qty / self.depth.lot_size()).round() <= 0.0 {
+                                        qty = 0.0;
+                                    }
                                     if self.own_fill_depletion {
                                         qty = own_fill_available(
                                             qty,
