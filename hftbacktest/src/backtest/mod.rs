@@ -1558,3 +1558,169 @@ mod ab3465_through_fills_capped {
         }
     }
 }
+
+#[cfg(test)]
+mod ab3465_review_cases {
+    use crate::{
+        backtest::{
+            Backtest, DataSource, ExchangeKind, L2AssetBuilder,
+            assettype::LinearAsset,
+            data::Data,
+            models::{
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
+                TradingValueFeeModel,
+            },
+        },
+        depth::{HashMapMarketDepth, MarketDepth},
+        prelude::Bot,
+        types::*,
+    };
+
+    fn ev(t: i64, e: u64, px: f64, qty: f64) -> Event {
+        Event { ev: e | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival: 0, fval: 0.0 }
+    }
+    fn bid(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | BUY_EVENT, px, q) }
+    fn ask(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | SELL_EVENT, px, q) }
+    fn buy_trade(t: i64, px: f64, q: f64) -> Event { ev(t, TRADE_EVENT | BUY_EVENT, px, q) }
+    fn sell_trade(t: i64, px: f64, q: f64) -> Event { ev(t, TRADE_EVENT | SELL_EVENT, px, q) }
+
+    /// Book 98 / 102. `orders` = (id, is_buy, px, qty) GTX at t=3, then `later`. Returns (position, open order count).
+    fn run(orders: &[(u64, bool, f64, f64)], later: &[Event]) -> (f64, usize) {
+        let mut events = vec![bid(1, 98.0, 1.0), ask(2, 102.0, 1.0), ev(3, 0, 0.0, 0.0)];
+        events.extend_from_slice(later);
+        events.push(ev(50, 0, 0.0, 0.0));
+        let asset = L2AssetBuilder::default()
+            .data(vec![DataSource::Data(Data::from_data(&events))])
+            .latency_model(ConstantLatency::new(0, 0))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(0.00004, 0.00028)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+            .exchange(ExchangeKind::PartialFillExchange)
+            .depth(|| HashMapMarketDepth::new(1.0, 0.01))
+            .build()
+            .unwrap();
+        let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
+        bt.elapse(3).unwrap();
+        for &(id, b, px, q) in orders {
+            if b {
+                bt.submit_buy_order(0, id, px, q, TimeInForce::GTX, OrdType::Limit, false).unwrap();
+            } else {
+                bt.submit_sell_order(0, id, px, q, TimeInForce::GTX, OrdType::Limit, false).unwrap();
+            }
+        }
+        bt.elapse(50).unwrap();
+        let open = bt.orders(0).values().filter(|o| o.active()).count();
+        (bt.position(0), open)
+    }
+
+    fn near(a: f64, b: f64) -> bool { (a - b).abs() < 1e-9 }
+
+    // R1: a print through a crossed remainder fills it.
+    #[test]
+    fn r1_crossed_remainder_trade_through_near() {
+        let (p, _) = run(&[(1, false, 100.0, 1.0)], &[bid(10, 101.0, 0.2), buy_trade(11, 102.0, 0.1)]);
+        assert!(near(p, -0.3), "print at 102 through our 100 ask should fill 0.1 more; got {p}");
+    }
+    #[test]
+    fn r1b_crossed_remainder_trade_through_far() {
+        let (p, _) = run(&[(1, false, 100.0, 1.0)], &[bid(10, 101.0, 0.2), buy_trade(11, 104.0, 0.1)]);
+        assert!(near(p, -0.3), "got {p}");
+    }
+    #[test]
+    fn r1c_buy_side_mirror() {
+        let (p, _) = run(&[(1, true, 100.0, 1.0)], &[ask(10, 99.0, 0.2), sell_trade(11, 98.0, 0.1)]);
+        assert!(near(p, 0.3), "print at 98 through our 100 bid should fill 0.1 more; got {p}");
+    }
+
+    // R2: crossing quantity that leaves and comes back fills again.
+    #[test]
+    fn r2_recross_by_new_liquidity() {
+        let (p, _) = run(
+            &[(1, false, 100.0, 1.0)],
+            &[bid(10, 101.0, 0.2), bid(11, 101.0, 0.0), bid(12, 101.0, 0.2)],
+        );
+        assert!(near(p, -0.4), "a second 0.2 bid crossing after the first left should fill 0.2; got {p}");
+    }
+
+    // R3: crossing quantity that grows without the best moving fills as it grows.
+    #[test]
+    fn r3_crossing_level_grows() {
+        let (p, _) = run(&[(1, false, 100.0, 1.0)], &[bid(10, 101.0, 0.2), bid(11, 101.0, 0.5)]);
+        assert!(near(p, -0.5), "crossing grew to 0.5; got {p}");
+    }
+    #[test]
+    fn r3b_backlog_released_by_unrelated_tick() {
+        let (p, _) = run(
+            &[(1, false, 100.0, 1.0)],
+            &[bid(10, 101.0, 0.2), bid(11, 101.0, 0.5), bid(12, 102.0, 0.01)],
+        );
+        assert!(near(p, -0.51), "got {p}");
+    }
+
+    // R4: one print or one crossing level is one budget across all our orders.
+    #[test]
+    fn r4_one_print_fills_two_own_orders() {
+        let (p, _) = run(&[(1, false, 100.0, 1.0), (2, false, 101.0, 1.0)], &[buy_trade(10, 102.0, 0.03)]);
+        assert!(near(p, -0.03), "a 0.03 taker fills 0.03 across our book; got {p}");
+    }
+    #[test]
+    fn r4b_one_crossing_level_fills_two_own_orders() {
+        let (p, _) = run(&[(1, false, 100.0, 1.0), (2, false, 101.0, 1.0)], &[bid(10, 101.0, 0.2)]);
+        assert!(near(p, -0.2), "a 0.2 crossing bid fills 0.2 across our book; got {p}");
+    }
+
+    // R5: through-trade then a cross from the same seller's rest: should equal seller size (sanity, expected pass).
+    #[test]
+    fn r5_taker_rest_after_through_print() {
+        let (p, _) = run(&[(1, true, 100.0, 1.0)], &[sell_trade(10, 98.0, 0.3), bid(11, 98.0, 0.7), ask(12, 98.0, 0.2)]);
+        assert!(near(p, 0.5), "got {p}");
+    }
+
+    // R6: depth clear + snapshot re-send does not double-fill (expected pass).
+    #[test]
+    fn r6_clear_and_resnapshot() {
+        let (p, _) = run(
+            &[(1, false, 100.0, 1.0)],
+            &[bid(10, 101.0, 0.2), ev(11, DEPTH_CLEAR_EVENT | BUY_EVENT, 0.0, 0.0), bid(12, 98.0, 1.0), bid(12, 101.0, 0.2)],
+        );
+        assert!(near(p, -0.2), "got {p}");
+    }
+
+    // R7: a zero-quantity print through our price.
+    #[test]
+    fn r7_zero_qty_print() {
+        let (p, open) = run(&[(1, false, 100.0, 1.0)], &[buy_trade(10, 102.0, 0.0)]);
+        assert!(near(p, 0.0) && open == 1, "got {p} open={open}");
+    }
+
+    // R8: sum of many prints exactly fills and retires the order; extra prints do not panic.
+    #[test]
+    fn r8_exact_fill_then_more_prints() {
+        let mut later = vec![];
+        for i in 0..12 { later.push(buy_trade(10 + i, 102.0, 0.1)); }
+        let (p, open) = run(&[(1, false, 100.0, 1.0)], &later);
+        assert!(near(p, -1.0) && open == 0, "got {p} open={open}");
+    }
+
+    // R9: cross partial + trade-through completes and retires; then further crossing is ignored.
+    #[test]
+    fn r9_cross_then_through_then_cross() {
+        let (p, open) = run(
+            &[(1, false, 100.0, 1.0)],
+            &[bid(10, 101.0, 0.6), buy_trade(11, 106.0, 0.4), bid(12, 101.0, 2.0), bid(13, 103.0, 2.0)],
+        );
+        assert!(near(p, -1.0) && open == 0, "got {p} open={open}");
+    }
+
+    // R10: only displayed crossing quantity fills.
+    #[test]
+    fn r10_stale_level_counted_as_crossing() {
+        // bids 98(1.0) + 101(0.5) is set up after the base book; ask 100 crosses 101 (left stale), then ask 100 leaves.
+        let (p, _) = run(
+            &[(1, false, 100.0, 1.0)],
+            &[bid(10, 99.0, 0.1), bid(11, 100.0, 0.1), bid(12, 102.0, 0.1)],
+        );
+        // control: crossing displayed = 100(0.1)+101(0)+102(0.1)
+        assert!(near(p, -0.2), "control got {p}");
+    }
+}
