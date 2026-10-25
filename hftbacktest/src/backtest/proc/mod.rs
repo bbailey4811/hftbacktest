@@ -109,6 +109,10 @@ impl<P: Processor + ?Sized> Processor for Box<P> {
         P::process(self, event)
     }
 
+    fn process_as_of(&mut self, event: &Event, as_of: i64) -> Result<(), BacktestError> {
+        P::process_as_of(self, event, as_of)
+    }
+
     fn process_recv_order(
         &mut self,
         timestamp: i64,
