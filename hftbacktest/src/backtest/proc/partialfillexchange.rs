@@ -474,6 +474,12 @@ where
     }
 
     fn on_bid_qty_chg(&mut self, price_tick: i64, prev_qty: f64, new_qty: f64, batch_stamp: i64) {
+        // AB#3465: the batch's depletion at this level before this update that no print has explained yet (an
+        // order joining between two of the batch's updates never saw it).
+        let unseen = match self.batch_decrease_bid.get(&price_tick) {
+            Some(&(stamp, unexplained)) if batch_stamp > 0 && stamp == batch_stamp => unexplained,
+            _ => 0.0,
+        };
         // AB#3465: a stamped decrease is remembered per level until a print of its batch explains it.
         if batch_stamp > 0 {
             if new_qty < prev_qty {
@@ -499,6 +505,7 @@ where
                         new_qty,
                         &self.depth,
                         batch_stamp,
+                        unseen,
                     );
                 } else {
                     self.queue_model
@@ -509,6 +516,12 @@ where
     }
 
     fn on_ask_qty_chg(&mut self, price_tick: i64, prev_qty: f64, new_qty: f64, batch_stamp: i64) {
+        // AB#3465: the batch's depletion at this level before this update that no print has explained yet (an
+        // order joining between two of the batch's updates never saw it).
+        let unseen = match self.batch_decrease_ask.get(&price_tick) {
+            Some(&(stamp, unexplained)) if batch_stamp > 0 && stamp == batch_stamp => unexplained,
+            _ => 0.0,
+        };
         // AB#3465: a stamped decrease is remembered per level until a print of its batch explains it.
         if batch_stamp > 0 {
             if new_qty < prev_qty {
@@ -534,6 +547,7 @@ where
                         new_qty,
                         &self.depth,
                         batch_stamp,
+                        unseen,
                     );
                 } else {
                     self.queue_model

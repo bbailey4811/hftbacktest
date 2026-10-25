@@ -2253,6 +2253,12 @@ mod ab3465_batch_dedup_exact {
     /// to each of `changes` in turn, all before the prints (t=30, 31, ...) or all after them (t=45, 46, ...).
     /// Our position, and each order's executed quantity.
     fn run(ahead: f64, ours: &[f64], level: f64, prints: &[f64], changes: &[f64], changes_first: bool) -> (f64, Vec<f64>) {
+        run_split(ahead, ours, level, prints, changes, if changes_first { changes.len() } else { 0 })
+    }
+
+    /// As [`run`], with the first `before` changes ahead of the prints (t=30, 31, ...) and the rest after them
+    /// (t=45, 46, ...): `before` 0 is print first.
+    fn run_split(ahead: f64, ours: &[f64], level: f64, prints: &[f64], changes: &[f64], before: usize) -> (f64, Vec<f64>) {
         let mut events = vec![
             event(1, DEPTH_EVENT | BUY_EVENT, 98.0, 1.0, 0),
             event(2, DEPTH_EVENT | SELL_EVENT, 100.0, ahead, 0),
@@ -2265,9 +2271,9 @@ mod ab3465_batch_dedup_exact {
         for (i, &q) in prints.iter().enumerate() {
             events.push(event(40 + i as i64, TRADE_EVENT | BUY_EVENT, 100.0, q, 0));
         }
-        let at = if changes_first { 30 } else { 45 };
         for (i, &q) in changes.iter().enumerate() {
-            events.push(event(at + i as i64, DEPTH_EVENT | SELL_EVENT, 100.0, q, STAMP));
+            let at = if i < before { 30 + i as i64 } else { 45 + i as i64 };
+            events.push(event(at, DEPTH_EVENT | SELL_EVENT, 100.0, q, STAMP));
         }
         events.sort_by_key(|e| e.exch_ts);
         events.push(event(60, 0, 0.0, 0.0, 0));
@@ -2348,8 +2354,11 @@ mod ab3465_batch_dedup_exact {
             let ours: Vec<f64> = (0..1 + next(2)).map(|_| (1 + next(150)) as f64 * LOT).collect();
             let prints: Vec<f64> = (0..1 + next(3)).map(|_| (1 + next(400)) as f64 * LOT).collect();
             let changes: Vec<f64> = (0..1 + next(3)).map(|_| next(700) as f64 * LOT).collect();
+            // Any number of the batch's changes (a level touched up to three times in one stamp) ahead of the
+            // prints: all of them, or only some, with the rest after.
+            let before = 1 + next(changes.len() as u64) as usize;
             let print_first = run(ahead, &ours, level, &prints, &changes, false);
-            let depletion_first = run(ahead, &ours, level, &prints, &changes, true);
+            let depletion_first = run_split(ahead, &ours, level, &prints, &changes, before);
             assert_eq!(
                 depletion_first, print_first,
                 "ahead {ahead} level {level} ours {ours:?} prints {prints:?} changes {changes:?}"
@@ -2359,6 +2368,109 @@ mod ab3465_batch_dedup_exact {
             }
         }
         assert!(reached > 300, "the prints reach our orders in many cases ({reached})");
+    }
+}
+
+/// AB#3465 (gentilly): an order that joins a level between two updates of one stamped batch (the prints' depletion
+/// shown first, then more of the batch) never saw that depletion: the batch's prints are not ahead of it again.
+#[cfg(test)]
+mod ab3465_batch_dedup_join_mid_batch {
+    use crate::{
+        backtest::{
+            Backtest, DataSource, ExchangeKind, L2AssetBuilder,
+            assettype::LinearAsset,
+            data::Data,
+            models::{
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
+                TradingValueFeeModel,
+            },
+        },
+        depth::HashMapMarketDepth,
+        prelude::Bot,
+        types::*,
+    };
+
+    const STAMP: i64 = 50;
+    const LOT: f64 = 0.00001;
+
+    fn event(t: i64, ev: u64, px: f64, qty: f64, ival: i64) -> Event {
+        Event { ev: ev | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival, fval: 0.0 }
+    }
+
+    /// `level` rests at the ask 100; our `ours` sell joins at t=25. Batch stamped 50: the buy prints `prints` (t=40,
+    /// 41, ...), the level's depletion by them (to `level - sum(prints)`, floored at 0) and then the level at each of
+    /// `more` in turn. Depletion first: the depletion at t=20 (before we join), `more` at t=30, 31, ... Print first:
+    /// the prints, then the depletion at t=45 and `more` from t=46. Our position.
+    fn run(level: f64, ours: f64, prints: &[f64], more: &[f64], depletion_first: bool) -> f64 {
+        let depleted = (level - prints.iter().sum::<f64>()).max(0.0);
+        let mut events = vec![
+            event(1, DEPTH_EVENT | BUY_EVENT, 98.0, 1.0, 0),
+            event(2, DEPTH_EVENT | SELL_EVENT, 100.0, level, 0),
+            event(25, 0, 0.0, 0.0, 0),
+        ];
+        for (i, &q) in prints.iter().enumerate() {
+            events.push(event(40 + i as i64, TRADE_EVENT | BUY_EVENT, 100.0, q, 0));
+        }
+        let (first, rest) = if depletion_first { (20, 30) } else { (45, 46) };
+        events.push(event(first, DEPTH_EVENT | SELL_EVENT, 100.0, depleted, STAMP));
+        for (i, &q) in more.iter().enumerate() {
+            events.push(event(rest + i as i64, DEPTH_EVENT | SELL_EVENT, 100.0, q, STAMP));
+        }
+        events.sort_by_key(|e| e.exch_ts);
+        events.push(event(60, 0, 0.0, 0.0, 0));
+        let asset = L2AssetBuilder::default()
+            .data(vec![DataSource::Data(Data::from_data(&events))])
+            .latency_model(ConstantLatency::new(0, 0))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(0.00004, 0.00028)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(0.5)))
+            .exchange(ExchangeKind::PartialFillExchange)
+            .depth(|| HashMapMarketDepth::new(1.0, LOT))
+            .build()
+            .unwrap();
+        let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
+        bt.elapse(25).unwrap();
+        bt.submit_sell_order(0, 1, 100.0, ours, TimeInForce::GTX, OrdType::Limit, false)
+            .unwrap();
+        bt.elapse(60).unwrap();
+        bt.position(0)
+    }
+
+    /// Re-review 3 (M1): 0.001 at the ask, the batch drops it to 0.0004 (a 0.0006 print's depletion), our sell joins,
+    /// the batch refills to 0.0009, then the print. The earlier fix replayed the whole print on a queue that already
+    /// excluded it: a 0.0002 phantom fill.
+    #[test]
+    fn an_order_joining_between_two_changes_of_a_batch_is_not_filled_by_the_already_depleted_print() {
+        assert_eq!(run(0.001, 0.001, &[0.0006], &[0.0009], false), 0.0, "print first");
+        assert_eq!(run(0.001, 0.001, &[0.0006], &[0.0009], true), 0.0, "depletion first");
+    }
+
+    /// Random batches: the level, our size, one to three prints (together possibly more than the level, which then
+    /// reach us) and zero to three further updates of the batch. Depletion first gives the position print first gives.
+    #[test]
+    fn joining_mid_batch_fills_what_print_first_fills() {
+        let mut seed: u64 = 0x3465_0002;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut reached = 0;
+        for _ in 0..3000 {
+            let level = next(300) as f64 * LOT;
+            let ours = (1 + next(150)) as f64 * LOT;
+            let prints: Vec<f64> = (0..1 + next(3)).map(|_| (1 + next(250)) as f64 * LOT).collect();
+            let more: Vec<f64> = (0..next(4)).map(|_| next(700) as f64 * LOT).collect();
+            let print_first = run(level, ours, &prints, &more, false);
+            let depletion_first = run(level, ours, &prints, &more, true);
+            assert_eq!(
+                depletion_first, print_first,
+                "level {level} ours {ours} prints {prints:?} more {more:?}"
+            );
+            if print_first != 0.0 {
+                reached += 1;
+            }
+        }
+        assert!(reached > 300, "the prints reach our order in many cases ({reached})");
     }
 }
 

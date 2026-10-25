@@ -32,8 +32,11 @@ where
     /// AB#3465 (gentilly): [`QueueModel::depth`] for a level update that a publishing batch stamped `batch_stamp`
     /// carries (the batch's own send time). A depth feed spread backward over its batch interval can show a print's
     /// depletion BEFORE the print it publishes; a model that remembers the batch's level changes can then
-    /// de-duplicate the print in either order. Required, with no default, so a wrapping model cannot silently drop
-    /// the de-duplication by forwarding only [`QueueModel::depth`].
+    /// de-duplicate the print in either order. `unseen` is how much of the batch's decreases at this level BEFORE
+    /// this update no print of the batch has explained yet: depletion the order cannot have seen (it joined the level
+    /// after it), which a later print of the batch must not take from the order's queue again. Required, with no
+    /// default, so a wrapping model cannot silently drop the de-duplication by forwarding only
+    /// [`QueueModel::depth`].
     fn depth_in_batch(
         &self,
         order: &mut Order,
@@ -41,6 +44,7 @@ where
         new_qty: f64,
         depth: &MD,
         batch_stamp: i64,
+        unseen: f64,
     );
 
     /// AB#3465 (gentilly): [`QueueModel::trade`] for a print whose own time is `timestamp`. `explained` is the part
@@ -110,6 +114,7 @@ where
         new_qty: f64,
         depth: &MD,
         _batch_stamp: i64,
+        _unseen: f64,
     ) {
         self.depth(order, prev_qty, new_qty, depth);
     }
@@ -163,6 +168,9 @@ struct BatchReplay {
     shadow_cum_trade: f64,
     /// The batch's level changes at the order's price, `(prev_qty, new_qty)` in feed order.
     changes: Vec<(f64, f64)>,
+    /// The batch's depletion at this level from before the order's first change (it joined after it), not yet
+    /// explained by a print: the batch's next prints are that depletion and do not reach the order's queue.
+    unseen: f64,
 }
 
 impl AnyClone for QueuePos {
@@ -250,8 +258,9 @@ where
     }
 
     /// AB#3465 (gentilly): a stamped level change is applied as [`Self::depth`] applies it, and remembered with the
-    /// queue it was applied to. The first change of a batch at this price records the queue before it; each later
-    /// change of the same batch is appended.
+    /// queue it was applied to. The first change of a batch at this price records the queue before it, and the
+    /// batch's depletion there that the order joined after (`unseen`); each later change of the same batch is
+    /// appended.
     fn depth_in_batch(
         &self,
         order: &mut Order,
@@ -259,6 +268,7 @@ where
         new_qty: f64,
         _depth: &MD,
         batch_stamp: i64,
+        unseen: f64,
     ) {
         let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
         match q.batch.as_mut() {
@@ -269,6 +279,7 @@ where
                     shadow_front: q.front_q_qty,
                     shadow_cum_trade: q.cum_trade_qty,
                     changes: vec![(prev_qty, new_qty)],
+                    unseen: unseen.max(0.0),
                 })
             }
         }
@@ -280,7 +291,8 @@ where
     /// the one a print-first feed gives): the print is a trade on the queue as it stood before the batch's changes,
     /// with the batch's earlier prints applied the same way and their fills reset; [`QueueModel::is_filled`] then
     /// reports the fill it gives there; and the batch's changes are applied again over that queue, net of all the
-    /// batch's prints so far.
+    /// batch's prints so far. The part of a print that is the batch's depletion from before the order joined the
+    /// level (`unseen` when its first change was recorded) never reaches the order.
     ///
     /// An order that saw none of the batch's changes but joined after its depletion queued behind a level that
     /// already excluded the `explained` part, so only the rest of the print advances it. Any other print is
@@ -296,6 +308,11 @@ where
         let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
         match q.batch.as_mut() {
             Some(batch) if timestamp <= batch.stamp => {
+                // The batch's depletion the order joined after is what the batch's first prints took; that part
+                // of a print is not ahead of the order (as for an order that saw none of the batch's changes).
+                let before_join = qty.min(batch.unseen);
+                batch.unseen -= before_join;
+                let qty = qty - before_join;
                 // The print first, as `trade` then `is_filled` apply it.
                 batch.shadow_front -= qty;
                 batch.shadow_cum_trade += qty;
@@ -1571,7 +1588,7 @@ mod ab3465_batch_depletion_tests {
         let depletion = |order: &mut Order, depth: &mut HashMapMarketDepth| {
             depth.update_ask_depth(ASK, 0.0004, 30);
             if stamped {
-                m.depth_in_batch(order, 0.001, 0.0004, depth, STAMP);
+                m.depth_in_batch(order, 0.001, 0.0004, depth, STAMP, 0.0);
             } else {
                 m.depth(order, 0.001, 0.0004, depth);
             }
@@ -1647,7 +1664,7 @@ mod ab3465_batch_depletion_tests {
         let m = model();
         let (mut depth, mut order) = setup(0.001);
         depth.update_ask_depth(ASK, 0.0004, 30);
-        m.depth_in_batch(&mut order, 0.001, 0.0004, &depth, STAMP);
+        m.depth_in_batch(&mut order, 0.001, 0.0004, &depth, STAMP, 0.0);
         let after_depletion = front(&mut order);
         // A print of a later batch (after STAMP) advances the queue in full.
         m.trade_in_batch(&mut order, 0.0002, &depth, STAMP + 1, 0.0);
