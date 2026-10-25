@@ -138,6 +138,19 @@ pub trait Processor {
     /// Process an event and advance the state of this processor.
     fn process(&mut self, event: &Event) -> Result<(), BacktestError>;
 
+    /// (gentilly, AB#3465) Process an exchange event as the venue made it at `as_of`, though it is applied later:
+    /// a trade, or the opposite book crossing our resting orders, meets only the orders that stood on the venue at
+    /// `as_of` (accepted, or last re-priced, at or before it). For a live adapter whose feed reaches it after the
+    /// venue made the event, while its own orders reach the venue on the adapter's clock. A processor that does not
+    /// know when its orders arrived cannot do this and refuses.
+    fn process_as_of(&mut self, event: &Event, as_of: i64) -> Result<(), BacktestError> {
+        let _ = (event, as_of);
+        Err(BacktestError::DataError(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this processor cannot process an event as of an earlier time",
+        )))
+    }
+
     /// Processes an order upon receipt. This is invoked when the backtesting time reaches the order
     /// receipt timestamp.
     /// Returns Ok(true) if the order with `wait_resp_order_id` is received and processed.

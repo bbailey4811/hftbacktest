@@ -784,6 +784,33 @@ where
         asset_no: usize,
         event: &Event,
     ) -> Result<ElapseResult, BacktestError> {
+        self.apply_external_event(asset_no, event, None)
+    }
+
+    /// (gentilly, AB#3465) [`Self::apply_external_feed_event`] for an event the venue made at `as_of`, earlier than
+    /// it is applied: its trade or crossing meets only the orders that stood on the exchange by then
+    /// ([`Processor::process_as_of`]). `as_of` is at most the event's exchange time.
+    pub fn apply_external_feed_event_as_of(
+        &mut self,
+        asset_no: usize,
+        event: &Event,
+        as_of: i64,
+    ) -> Result<ElapseResult, BacktestError> {
+        if as_of > event.exch_ts {
+            return Err(BacktestError::DataError(IoError::new(
+                ErrorKind::InvalidData,
+                "an external event cannot be processed as of a time after it",
+            )));
+        }
+        self.apply_external_event(asset_no, event, Some(as_of))
+    }
+
+    fn apply_external_event(
+        &mut self,
+        asset_no: usize,
+        event: &Event,
+        as_of: Option<i64>,
+    ) -> Result<ElapseResult, BacktestError> {
         if self.cur_ts == i64::MAX {
             self.initialize_evs()?;
             match self.evs.next() {
@@ -832,7 +859,10 @@ where
                 )));
             }
             let exch = self.exch.get_mut(asset_no).unwrap();
-            exch.processor.process(event)?;
+            match as_of {
+                Some(as_of) => exch.processor.process_as_of(event, as_of)?,
+                None => exch.processor.process(event)?,
+            }
             self.cur_ts = ts;
         }
         Ok(result)
