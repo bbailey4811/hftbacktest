@@ -151,6 +151,11 @@ where
     // that stamp no batch (`ival` 0) never fill these, and keep the behaviour from before.
     batch_decrease_bid: HashMap<i64, (i64, f64)>,
     batch_decrease_ask: HashMap<i64, (i64, f64)>,
+    // AB#3465 (gentilly): when each resting order arrived at the exchange at its current price (a re-price arrives
+    // anew; a size cut keeps its time), and, while an event is processed as of an earlier time, that time: only the
+    // orders that stood by then are met by its trade or crossing.
+    arrived: HashMap<OrderId, i64>,
+    as_of: Option<i64>,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -187,6 +192,8 @@ where
             ask_rebuild: None,
             batch_decrease_bid: Default::default(),
             batch_decrease_ask: Default::default(),
+            arrived: Default::default(),
+            as_of: None,
         }
     }
 
@@ -227,6 +234,11 @@ where
                 }
             })
             .flat_map(|(tick, ids)| ids.iter().map(move |id| (*tick, *id)))
+            // AB#3465 (gentilly): processed as of an earlier time, only the orders that stood by then.
+            .filter(|(_, id)| {
+                self.as_of
+                    .is_none_or(|as_of| self.arrived.get(id).is_some_and(|at| *at <= as_of))
+            })
             .collect();
         if side == Side::Sell {
             met.sort_unstable();
@@ -455,6 +467,7 @@ where
             let mut orders = orders.borrow_mut();
             for order_id in std::mem::take(&mut self.filled_orders) {
                 let order = orders.remove(&order_id).unwrap();
+                self.arrived.remove(&order_id);
                 self.unladder(order.side, order.price_tick, order_id);
             }
         }
@@ -534,6 +547,15 @@ where
     // response (`fill::<true>`), so the local processor can book each fill at
     // its own price; the final ack response then reports no new execution.
     fn ack_new(&mut self, order: &mut Order, timestamp: i64) -> Result<(), BacktestError> {
+        let acked = self.ack_new_order(order, timestamp);
+        // AB#3465 (gentilly): a resting order stands on the exchange from the time it arrived.
+        if self.orders.borrow().contains_key(&order.order_id) {
+            self.arrived.insert(order.order_id, timestamp);
+        }
+        acked
+    }
+
+    fn ack_new_order(&mut self, order: &mut Order, timestamp: i64) -> Result<(), BacktestError> {
         if self.orders.borrow().contains_key(&order.order_id) {
             return Err(BacktestError::OrderIdExist);
         }
@@ -850,6 +872,7 @@ where
         let _ = std::mem::replace(order, exch_order);
 
         // Deletes the order.
+        self.arrived.remove(&order.order_id);
         self.unladder(order.side, order.price_tick, order.order_id);
         order.status = Status::Canceled;
         order.exch_timestamp = timestamp;
@@ -915,6 +938,13 @@ where
 {
     fn event_seen_timestamp(&self, event: &Event) -> Option<i64> {
         event.is(EXCH_EVENT).then_some(event.exch_ts)
+    }
+
+    fn process_as_of(&mut self, event: &Event, as_of: i64) -> Result<(), BacktestError> {
+        self.as_of = Some(as_of);
+        let processed = self.process(event);
+        self.as_of = None;
+        processed
     }
 
     fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
