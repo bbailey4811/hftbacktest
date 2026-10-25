@@ -2099,3 +2099,94 @@ mod ab3465_review3_cases {
         assert!(near(p, -2.0) && open == 0, "got {p} open={open}");
     }
 }
+
+/// AB#3465 (gentilly): a print and the depth update that publishes its depletion are de-duplicated by the exchange in
+/// either feed order when the depth event carries its publishing batch's stamp (`ival`, the batch's send time).
+#[cfg(test)]
+mod ab3465_batch_depletion_exchange {
+    use crate::{
+        backtest::{
+            Backtest, DataSource, ExchangeKind, L2AssetBuilder,
+            assettype::LinearAsset,
+            data::Data,
+            models::{
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
+                TradingValueFeeModel,
+            },
+        },
+        depth::HashMapMarketDepth,
+        prelude::Bot,
+        types::*,
+    };
+
+    fn event(t: i64, ev: u64, px: f64, qty: f64, stamp: i64) -> Event {
+        Event {
+            ev: ev | EXCH_EVENT | LOCAL_EVENT,
+            exch_ts: t,
+            local_ts: t,
+            px,
+            qty,
+            order_id: 0,
+            ival: stamp,
+            fval: 0.0,
+        }
+    }
+
+    /// 0.001 rests at the ask 100; our 0.001 sell joins behind it at t=3; then a 0.0006 buy print at t=40 and the
+    /// batch stamped 50 publishing the level at 0.0004 (its row at pseudo time `depletion_at`).
+    fn position(depletion_at: i64, stamp: i64) -> f64 {
+        let mut events = vec![
+            event(1, DEPTH_EVENT | BUY_EVENT, 98.0, 1.0, 0),
+            event(2, DEPTH_EVENT | SELL_EVENT, 100.0, 0.001, 0),
+            event(3, 0, 0.0, 0.0, 0),
+        ];
+        let mut later = vec![
+            event(40, TRADE_EVENT | BUY_EVENT, 100.0, 0.0006, 0),
+            event(depletion_at, DEPTH_EVENT | SELL_EVENT, 100.0, 0.0004, stamp),
+        ];
+        later.sort_by_key(|e| e.exch_ts);
+        events.extend(later);
+        events.push(event(60, 0, 0.0, 0.0, 0));
+        let asset = L2AssetBuilder::default()
+            .data(vec![DataSource::Data(Data::from_data(&events))])
+            .latency_model(ConstantLatency::new(0, 0))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(0.00004, 0.00028)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(0.5)))
+            .exchange(ExchangeKind::PartialFillExchange)
+            .depth(|| HashMapMarketDepth::new(1.0, 0.00001))
+            .build()
+            .unwrap();
+        let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
+        bt.elapse(3).unwrap();
+        bt.submit_sell_order(0, 1, 100.0, 0.001, TimeInForce::GTX, OrdType::Limit, false)
+            .unwrap();
+        bt.elapse(60).unwrap();
+        bt.position(0)
+    }
+
+    #[test]
+    fn a_print_that_does_not_reach_our_order_never_fills_it_in_either_order() {
+        assert_eq!(position(45, 50), 0.0, "print first");
+        assert_eq!(
+            position(35, 50),
+            0.0,
+            "depletion of the print's own batch first"
+        );
+    }
+
+    #[test]
+    fn an_unstamped_feed_keeps_the_previous_behaviour() {
+        assert_eq!(position(45, 0), 0.0, "print first");
+        assert!(
+            position(35, 0) < 0.0,
+            "unstamped depletion first: the old double count"
+        );
+    }
+
+    #[test]
+    fn a_depletion_of_an_earlier_batch_does_not_explain_a_later_print() {
+        // The decrease belongs to a batch stamped 38, before the print at 40: it was cancels, the print is new.
+        assert!(position(35, 38) < 0.0);
+    }
+}

@@ -138,6 +138,12 @@ where
     // of that side drops the levels the rebuilt book no longer displays. `Some(None)`: cleared, rebuild not begun.
     bid_rebuild: Option<Option<i64>>,
     ask_rebuild: Option<Option<i64>>,
+    // AB#3465 (gentilly): per price level, the publishing batch (its send time, from a depth event's `ival`) of the
+    // level's latest stamped decrease and how much of that decrease no print of the batch has explained yet. A print
+    // of that batch seen after its depletion is de-duplicated against it (see `QueueModel::trade_in_batch`). Feeds
+    // that stamp no batch (`ival` 0) never fill these, and keep the behaviour from before.
+    batch_decrease_bid: HashMap<i64, (i64, f64)>,
+    batch_decrease_ask: HashMap<i64, (i64, f64)>,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -172,6 +178,8 @@ where
             crossed_ask: Default::default(),
             bid_rebuild: None,
             ask_rebuild: None,
+            batch_decrease_bid: Default::default(),
+            batch_decrease_ask: Default::default(),
         }
     }
 
@@ -231,6 +239,20 @@ where
         timestamp: i64,
     ) -> Result<(), BacktestError> {
         let mut budget = qty;
+        // AB#3465: the part of this print its own publishing batch already took off the level before the print.
+        let level_decreases = if side == Side::Sell {
+            &mut self.batch_decrease_ask
+        } else {
+            &mut self.batch_decrease_bid
+        };
+        let explained = match level_decreases.get_mut(&price_tick) {
+            Some((stamp, unexplained)) if timestamp <= *stamp && *unexplained > 0.0 => {
+                let explained = qty.min(*unexplained);
+                *unexplained -= explained;
+                explained
+            }
+            _ => 0.0,
+        };
         let orders = self.orders.clone();
         let mut orders_borrowed = orders.borrow_mut();
         for (tick, order_id) in self.orders_met_by_trade(side, price_tick) {
@@ -247,7 +269,13 @@ where
                     break;
                 }
                 // Updates the order's queue position.
-                self.queue_model.trade(order, budget, &self.depth);
+                self.queue_model.trade_in_batch(
+                    order,
+                    budget,
+                    &self.depth,
+                    timestamp,
+                    explained.min(budget),
+                );
                 let filled_qty = self.queue_model.is_filled(order, &self.depth);
                 if filled_qty > 0.0 {
                     // q_ahead is negative since is_filled is true and its value represents the
@@ -424,26 +452,72 @@ where
         }
     }
 
-    fn on_bid_qty_chg(&mut self, price_tick: i64, prev_qty: f64, new_qty: f64) {
+    fn on_bid_qty_chg(&mut self, price_tick: i64, prev_qty: f64, new_qty: f64, batch_stamp: i64) {
+        // AB#3465: a stamped decrease is remembered per level until a print of its batch explains it.
+        if batch_stamp > 0 {
+            if new_qty < prev_qty {
+                let entry = self
+                    .batch_decrease_bid
+                    .entry(price_tick)
+                    .or_insert((batch_stamp, 0.0));
+                if entry.0 != batch_stamp {
+                    *entry = (batch_stamp, 0.0);
+                }
+                entry.1 += prev_qty - new_qty;
+            }
+        }
         let orders = self.orders.clone();
         if let Some(order_ids) = self.buy_orders.get(&price_tick) {
             for order_id in order_ids.iter() {
                 let mut orders_borrowed = orders.borrow_mut();
                 let order = orders_borrowed.get_mut(order_id).unwrap();
-                self.queue_model
-                    .depth(order, prev_qty, new_qty, &self.depth);
+                if batch_stamp > 0 {
+                    self.queue_model.depth_in_batch(
+                        order,
+                        prev_qty,
+                        new_qty,
+                        &self.depth,
+                        batch_stamp,
+                    );
+                } else {
+                    self.queue_model
+                        .depth(order, prev_qty, new_qty, &self.depth);
+                }
             }
         }
     }
 
-    fn on_ask_qty_chg(&mut self, price_tick: i64, prev_qty: f64, new_qty: f64) {
+    fn on_ask_qty_chg(&mut self, price_tick: i64, prev_qty: f64, new_qty: f64, batch_stamp: i64) {
+        // AB#3465: a stamped decrease is remembered per level until a print of its batch explains it.
+        if batch_stamp > 0 {
+            if new_qty < prev_qty {
+                let entry = self
+                    .batch_decrease_ask
+                    .entry(price_tick)
+                    .or_insert((batch_stamp, 0.0));
+                if entry.0 != batch_stamp {
+                    *entry = (batch_stamp, 0.0);
+                }
+                entry.1 += prev_qty - new_qty;
+            }
+        }
         let orders = self.orders.clone();
         if let Some(order_ids) = self.sell_orders.get(&price_tick) {
             for order_id in order_ids.iter() {
                 let mut orders_borrowed = orders.borrow_mut();
                 let order = orders_borrowed.get_mut(order_id).unwrap();
-                self.queue_model
-                    .depth(order, prev_qty, new_qty, &self.depth);
+                if batch_stamp > 0 {
+                    self.queue_model.depth_in_batch(
+                        order,
+                        prev_qty,
+                        new_qty,
+                        &self.depth,
+                        batch_stamp,
+                    );
+                } else {
+                    self.queue_model
+                        .depth(order, prev_qty, new_qty, &self.depth);
+                }
             }
         }
     }
@@ -872,7 +946,7 @@ where
                 price_tick,
                 self.depth.bid_qty_at_tick(price_tick),
             );
-            self.on_bid_qty_chg(price_tick, prev_qty, new_qty);
+            self.on_bid_qty_chg(price_tick, prev_qty, new_qty, event.ival);
             own_fills_after_level_update(
                 &mut self.crossed_bid,
                 true,
@@ -902,7 +976,7 @@ where
                 price_tick,
                 self.depth.ask_qty_at_tick(price_tick),
             );
-            self.on_ask_qty_chg(price_tick, prev_qty, new_qty);
+            self.on_ask_qty_chg(price_tick, prev_qty, new_qty, event.ival);
             own_fills_after_level_update(
                 &mut self.crossed_ask,
                 true,

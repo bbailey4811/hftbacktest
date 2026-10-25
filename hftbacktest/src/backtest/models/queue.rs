@@ -28,6 +28,35 @@ where
     fn depth(&self, order: &mut Order, prev_qty: f64, new_qty: f64, depth: &MD);
 
     fn is_filled(&self, order: &mut Order, depth: &MD) -> f64;
+
+    /// AB#3465 (gentilly): [`QueueModel::depth`] for a level update that a publishing batch stamped `batch_stamp`
+    /// carries (the batch's own send time). A depth feed spread backward over its batch interval can show a print's
+    /// depletion BEFORE the print it publishes; a model that remembers the decrease can then de-duplicate the print in
+    /// either order. The default ignores the stamp.
+    fn depth_in_batch(
+        &self,
+        order: &mut Order,
+        prev_qty: f64,
+        new_qty: f64,
+        depth: &MD,
+        _batch_stamp: i64,
+    ) {
+        self.depth(order, prev_qty, new_qty, depth);
+    }
+
+    /// AB#3465 (gentilly): [`QueueModel::trade`] for a print at `timestamp`. `explained` is the part of `qty` that a
+    /// level decrease of the print's own publishing batch, seen before the print, already took off the level (the
+    /// print's depletion arriving first). The default ignores both.
+    fn trade_in_batch(
+        &self,
+        order: &mut Order,
+        qty: f64,
+        depth: &MD,
+        _timestamp: i64,
+        _explained: f64,
+    ) {
+        self.trade(order, qty, depth);
+    }
 }
 
 /// Provides a conservative queue position model, where your order's queue position advances only
@@ -91,6 +120,22 @@ where
 pub struct QueuePos {
     front_q_qty: f64,
     cum_trade_qty: f64,
+    /// AB#3465 (gentilly): the last level decrease of a stamped publishing batch this order saw, and the state it saw
+    /// it from, so a later print of the same batch can be applied as if it had come first.
+    batch_decrease: Option<BatchDecrease>,
+}
+
+/// AB#3465 (gentilly): one stamped level decrease as [`ProbQueueModel`] applied it.
+#[derive(Clone, Copy, Debug)]
+struct BatchDecrease {
+    /// The publishing batch's send time; a print at or before it belongs to the batch.
+    stamp: i64,
+    front_before: f64,
+    cum_trade_before: f64,
+    prev_qty: f64,
+    new_qty: f64,
+    /// Print quantity of the same batch at this level seen after the decrease.
+    later_trades: f64,
 }
 
 impl AnyClone for QueuePos {
@@ -108,6 +153,7 @@ impl Default for QueuePos {
         Self {
             front_q_qty: 0.0,
             cum_trade_qty: 0.0,
+            batch_decrease: None,
         }
     }
 }
@@ -180,6 +226,7 @@ where
         // For an increase of the quantity, front queue doesn't change by the quantity change.
         if chg < 0.0 {
             q.front_q_qty = q.front_q_qty.min(new_qty);
+            q.batch_decrease = None;
             return;
         }
 
@@ -193,6 +240,67 @@ where
 
         let est_front = front - (1.0 - prob) * chg + (back - prob * chg).min(0.0);
         q.front_q_qty = est_front.min(new_qty);
+        q.batch_decrease = None;
+    }
+
+    /// AB#3465 (gentilly): a stamped decrease is applied as [`Self::depth`] applies it, and remembered with the
+    /// state it was applied from.
+    fn depth_in_batch(
+        &self,
+        order: &mut Order,
+        prev_qty: f64,
+        new_qty: f64,
+        depth: &MD,
+        batch_stamp: i64,
+    ) {
+        let (front_before, cum_trade_before) = {
+            let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
+            (q.front_q_qty, q.cum_trade_qty)
+        };
+        self.depth(order, prev_qty, new_qty, depth);
+        let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
+        q.batch_decrease = (new_qty < prev_qty).then_some(BatchDecrease {
+            stamp: batch_stamp,
+            front_before,
+            cum_trade_before,
+            prev_qty,
+            new_qty,
+            later_trades: 0.0,
+        });
+    }
+
+    /// AB#3465 (gentilly): a print of the publishing batch of a decrease this order already saw is applied as if it
+    /// had come before that decrease (the order the feed's de-duplication assumes): the queue is rebuilt from the
+    /// state before the decrease, every print of the batch since is applied as a trade, and the decrease is applied
+    /// again net of them. An order that joined after that decrease (it saw none) queued behind a level that already
+    /// excluded the `explained` part, so only the rest of the print can advance it. Anything else is
+    /// [`Self::trade`].
+    fn trade_in_batch(
+        &self,
+        order: &mut Order,
+        qty: f64,
+        depth: &MD,
+        timestamp: i64,
+        explained: f64,
+    ) {
+        let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
+        match q.batch_decrease {
+            Some(mut seen) if timestamp <= seen.stamp => {
+                seen.later_trades += qty;
+                q.front_q_qty = seen.front_before - seen.later_trades;
+                q.cum_trade_qty = seen.cum_trade_before + seen.later_trades;
+                self.depth(order, seen.prev_qty, seen.new_qty, depth);
+                let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
+                q.batch_decrease = Some(seen);
+            }
+            _ => {
+                q.batch_decrease = None;
+                let advance = qty - explained.clamp(0.0, qty);
+                if advance > 0.0 {
+                    self.trade(order, advance, depth);
+                }
+            }
+        }
     }
 
     fn is_filled(&self, order: &mut Order, depth: &MD) -> f64 {
@@ -1346,5 +1454,140 @@ mod l3_tests {
                 &qm, 1
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod ab3465_batch_depletion_tests {
+    use super::*;
+    use crate::{
+        depth::{HashMapMarketDepth, L2MarketDepth},
+        types::{OrdType, Order, Side, TimeInForce},
+    };
+
+    const TICK: f64 = 0.1;
+    const LOT: f64 = 0.00001;
+    const ASK: f64 = 80_000.1;
+    const STAMP: i64 = 50;
+
+    fn model() -> ProbQueueModel<PowerProbQueueFunc3, HashMapMarketDepth> {
+        ProbQueueModel::new(PowerProbQueueFunc3::new(0.5))
+    }
+
+    /// Our 0.001 sell joins behind `ahead` at the best ask.
+    fn setup(ahead: f64) -> (HashMapMarketDepth, Order) {
+        let mut depth = HashMapMarketDepth::new(TICK, LOT);
+        depth.update_ask_depth(ASK, ahead, 1);
+        let mut order = Order::new(
+            1,
+            (ASK / TICK).round() as i64,
+            TICK,
+            0.001,
+            Side::Sell,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        model().new_order(&mut order, &depth);
+        (depth, order)
+    }
+
+    fn front(order: &mut Order) -> f64 {
+        order
+            .q
+            .as_any_mut()
+            .downcast_mut::<QueuePos>()
+            .unwrap()
+            .front_q_qty
+    }
+
+    /// The review's phantom-fill scenario: 0.001 ahead of us, a 0.0006 print takes from the front and the level
+    /// shows 0.0004. `(fill, front)` after both events.
+    fn run(depletion_first: bool, stamped: bool) -> (f64, f64) {
+        let m = model();
+        let (mut depth, mut order) = setup(0.001);
+        let depletion = |order: &mut Order, depth: &mut HashMapMarketDepth| {
+            depth.update_ask_depth(ASK, 0.0004, 30);
+            if stamped {
+                m.depth_in_batch(order, 0.001, 0.0004, depth, STAMP);
+            } else {
+                m.depth(order, 0.001, 0.0004, depth);
+            }
+        };
+        if depletion_first {
+            depletion(&mut order, &mut depth);
+        }
+        if stamped {
+            let explained = if depletion_first { 0.0006 } else { 0.0 };
+            m.trade_in_batch(&mut order, 0.0006, &depth, 40, explained);
+        } else {
+            m.trade(&mut order, 0.0006, &depth);
+        }
+        let filled = m.is_filled(&mut order, &depth);
+        if !depletion_first {
+            depletion(&mut order, &mut depth);
+        }
+        (filled, front(&mut order))
+    }
+
+    #[test]
+    fn the_print_is_de_duplicated_against_its_depletion_in_either_order() {
+        let (trade_first_fill, trade_first_front) = run(false, true);
+        let (depletion_first_fill, depletion_first_front) = run(true, true);
+        assert_eq!(trade_first_fill, 0.0, "0.0004 is still ahead of us");
+        assert_eq!(
+            depletion_first_fill, 0.0,
+            "no phantom fill when the depletion arrives first"
+        );
+        assert!(
+            (trade_first_front - depletion_first_front).abs() < 1e-12,
+            "{trade_first_front} vs {depletion_first_front}"
+        );
+    }
+
+    #[test]
+    fn the_trade_first_path_is_bit_identical_to_the_plain_model() {
+        assert_eq!(run(false, true), run(false, false));
+    }
+
+    #[test]
+    fn an_unstamped_feed_keeps_the_plain_double_count() {
+        let (fill, _) = run(true, false);
+        assert!(
+            fill > 0.0,
+            "the plain model counts the depletion as cancels and the print again"
+        );
+    }
+
+    #[test]
+    fn an_order_that_joined_after_the_depletion_is_advanced_only_by_the_unexplained_part() {
+        let m = model();
+        let mut depth = HashMapMarketDepth::new(TICK, LOT);
+        depth.update_ask_depth(ASK, 0.0004, 30);
+        // Joins behind 0.0004 after the depletion of a 0.0006 print not yet seen.
+        let mut order = Order::new(
+            2,
+            (ASK / TICK).round() as i64,
+            TICK,
+            0.001,
+            Side::Sell,
+            OrdType::Limit,
+            TimeInForce::GTC,
+        );
+        m.new_order(&mut order, &depth);
+        m.trade_in_batch(&mut order, 0.0006, &depth, 40, 0.0006);
+        assert_eq!(m.is_filled(&mut order, &depth), 0.0);
+        assert!((front(&mut order) - 0.0004).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_print_after_the_batch_is_a_plain_trade() {
+        let m = model();
+        let (mut depth, mut order) = setup(0.001);
+        depth.update_ask_depth(ASK, 0.0004, 30);
+        m.depth_in_batch(&mut order, 0.001, 0.0004, &depth, STAMP);
+        let after_depletion = front(&mut order);
+        // A print of a later batch (after STAMP) advances the queue in full.
+        m.trade_in_batch(&mut order, 0.0002, &depth, STAMP + 1, 0.0);
+        assert!((front(&mut order) - (after_depletion - 0.0002)).abs() < 1e-12);
     }
 }
