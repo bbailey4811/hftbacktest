@@ -31,32 +31,30 @@ where
 
     /// AB#3465 (gentilly): [`QueueModel::depth`] for a level update that a publishing batch stamped `batch_stamp`
     /// carries (the batch's own send time). A depth feed spread backward over its batch interval can show a print's
-    /// depletion BEFORE the print it publishes; a model that remembers the decrease can then de-duplicate the print in
-    /// either order. The default ignores the stamp.
+    /// depletion BEFORE the print it publishes; a model that remembers the batch's level changes can then
+    /// de-duplicate the print in either order. Required, with no default, so a wrapping model cannot silently drop
+    /// the de-duplication by forwarding only [`QueueModel::depth`].
     fn depth_in_batch(
         &self,
         order: &mut Order,
         prev_qty: f64,
         new_qty: f64,
         depth: &MD,
-        _batch_stamp: i64,
-    ) {
-        self.depth(order, prev_qty, new_qty, depth);
-    }
+        batch_stamp: i64,
+    );
 
-    /// AB#3465 (gentilly): [`QueueModel::trade`] for a print at `timestamp`. `explained` is the part of `qty` that a
-    /// level decrease of the print's own publishing batch, seen before the print, already took off the level (the
-    /// print's depletion arriving first). The default ignores both.
+    /// AB#3465 (gentilly): [`QueueModel::trade`] for a print whose own time is `timestamp`. `explained` is the part
+    /// of `qty` that a level decrease of the print's own publishing batch, seen before the print, already took off
+    /// the level (the print's depletion arriving first). Required, with no default (see
+    /// [`QueueModel::depth_in_batch`]).
     fn trade_in_batch(
         &self,
         order: &mut Order,
         qty: f64,
         depth: &MD,
-        _timestamp: i64,
-        _explained: f64,
-    ) {
-        self.trade(order, qty, depth);
-    }
+        timestamp: i64,
+        explained: f64,
+    );
 }
 
 /// Provides a conservative queue position model, where your order's queue position advances only
@@ -103,6 +101,31 @@ where
         *front_q_qty = front_q_qty.min(new_qty);
     }
 
+    /// AB#3465 (gentilly): this model advances only on trades and has no batch de-duplication; a stamped level
+    /// update is a plain one.
+    fn depth_in_batch(
+        &self,
+        order: &mut Order,
+        prev_qty: f64,
+        new_qty: f64,
+        depth: &MD,
+        _batch_stamp: i64,
+    ) {
+        self.depth(order, prev_qty, new_qty, depth);
+    }
+
+    /// AB#3465 (gentilly): a plain trade (see [`Self::depth_in_batch`]).
+    fn trade_in_batch(
+        &self,
+        order: &mut Order,
+        qty: f64,
+        depth: &MD,
+        _timestamp: i64,
+        _explained: f64,
+    ) {
+        self.trade(order, qty, depth);
+    }
+
     fn is_filled(&self, order: &mut Order, depth: &MD) -> f64 {
         let front_q_qty = order.q.as_any_mut().downcast_mut::<f64>().unwrap();
         let exec = (-*front_q_qty / depth.lot_size()).round() as i64;
@@ -120,22 +143,26 @@ where
 pub struct QueuePos {
     front_q_qty: f64,
     cum_trade_qty: f64,
-    /// AB#3465 (gentilly): the last level decrease of a stamped publishing batch this order saw, and the state it saw
-    /// it from, so a later print of the same batch can be applied as if it had come first.
-    batch_decrease: Option<BatchDecrease>,
+    /// AB#3465 (gentilly): the stamped publishing batch whose level changes at this order's price it has seen, kept
+    /// so that a print of that batch arriving after them is applied as if it had come before them.
+    batch: Option<BatchReplay>,
+    /// AB#3465 (gentilly): the fill a print of that batch gave the order as it would have print first, which
+    /// [`QueueModel::is_filled`] reports for that print.
+    batch_fill: Option<f64>,
 }
 
-/// AB#3465 (gentilly): one stamped level decrease as [`ProbQueueModel`] applied it.
-#[derive(Clone, Copy, Debug)]
-struct BatchDecrease {
+/// AB#3465 (gentilly): the trade-first view of one stamped publishing batch at the order's price.
+#[derive(Clone, Debug)]
+struct BatchReplay {
     /// The publishing batch's send time; a print at or before it belongs to the batch.
     stamp: i64,
-    front_before: f64,
-    cum_trade_before: f64,
-    prev_qty: f64,
-    new_qty: f64,
-    /// Print quantity of the same batch at this level seen after the decrease.
-    later_trades: f64,
+    /// The order's queue (`front_q_qty`, `cum_trade_qty`) as it stood before the batch's first level change at its
+    /// price, with every print of the batch seen since applied as a trade and its fill reset, exactly as the plain
+    /// model applies prints that precede the changes.
+    shadow_front: f64,
+    shadow_cum_trade: f64,
+    /// The batch's level changes at the order's price, `(prev_qty, new_qty)` in feed order.
+    changes: Vec<(f64, f64)>,
 }
 
 impl AnyClone for QueuePos {
@@ -153,7 +180,8 @@ impl Default for QueuePos {
         Self {
             front_q_qty: 0.0,
             cum_trade_qty: 0.0,
-            batch_decrease: None,
+            batch: None,
+            batch_fill: None,
         }
     }
 }
@@ -216,64 +244,46 @@ where
     }
 
     fn depth(&self, order: &mut Order, prev_qty: f64, new_qty: f64, _depth: &MD) {
-        let mut chg = prev_qty - new_qty;
-        // In order to avoid duplicate order queue position adjustment, subtract queue position
-        // change by trades.
         let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
-        chg -= q.cum_trade_qty;
-        // Reset, as quantity change by trade should be already reflected in qty.
-        q.cum_trade_qty = 0.0;
-        // For an increase of the quantity, front queue doesn't change by the quantity change.
-        if chg < 0.0 {
-            q.front_q_qty = q.front_q_qty.min(new_qty);
-            q.batch_decrease = None;
-            return;
-        }
-
-        let front = q.front_q_qty;
-        let back = prev_qty - front;
-
-        let mut prob = self.prob.prob(front, back);
-        if prob.is_infinite() {
-            prob = 1.0;
-        }
-
-        let est_front = front - (1.0 - prob) * chg + (back - prob * chg).min(0.0);
-        q.front_q_qty = est_front.min(new_qty);
-        q.batch_decrease = None;
+        self.apply_depth(&mut q.front_q_qty, &mut q.cum_trade_qty, prev_qty, new_qty);
+        q.batch = None;
     }
 
-    /// AB#3465 (gentilly): a stamped decrease is applied as [`Self::depth`] applies it, and remembered with the
-    /// state it was applied from.
+    /// AB#3465 (gentilly): a stamped level change is applied as [`Self::depth`] applies it, and remembered with the
+    /// queue it was applied to. The first change of a batch at this price records the queue before it; each later
+    /// change of the same batch is appended.
     fn depth_in_batch(
         &self,
         order: &mut Order,
         prev_qty: f64,
         new_qty: f64,
-        depth: &MD,
+        _depth: &MD,
         batch_stamp: i64,
     ) {
-        let (front_before, cum_trade_before) = {
-            let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
-            (q.front_q_qty, q.cum_trade_qty)
-        };
-        self.depth(order, prev_qty, new_qty, depth);
         let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
-        q.batch_decrease = (new_qty < prev_qty).then_some(BatchDecrease {
-            stamp: batch_stamp,
-            front_before,
-            cum_trade_before,
-            prev_qty,
-            new_qty,
-            later_trades: 0.0,
-        });
+        match q.batch.as_mut() {
+            Some(batch) if batch.stamp == batch_stamp => batch.changes.push((prev_qty, new_qty)),
+            _ => {
+                q.batch = Some(BatchReplay {
+                    stamp: batch_stamp,
+                    shadow_front: q.front_q_qty,
+                    shadow_cum_trade: q.cum_trade_qty,
+                    changes: vec![(prev_qty, new_qty)],
+                })
+            }
+        }
+        self.apply_depth(&mut q.front_q_qty, &mut q.cum_trade_qty, prev_qty, new_qty);
     }
 
-    /// AB#3465 (gentilly): a print of the publishing batch of a decrease this order already saw is applied as if it
-    /// had come before that decrease (the order the feed's de-duplication assumes): the queue is rebuilt from the
-    /// state before the decrease, every print of the batch since is applied as a trade, and the decrease is applied
-    /// again net of them. An order that joined after that decrease (it saw none) queued behind a level that already
-    /// excluded the `explained` part, so only the rest of the print can advance it. Anything else is
+    /// AB#3465 (gentilly): a print of a batch whose level changes this order already saw at its price is applied
+    /// exactly as it would have been had it arrived before them (the order the feed's de-duplication assumes, and
+    /// the one a print-first feed gives): the print is a trade on the queue as it stood before the batch's changes,
+    /// with the batch's earlier prints applied the same way and their fills reset; [`QueueModel::is_filled`] then
+    /// reports the fill it gives there; and the batch's changes are applied again over that queue, net of all the
+    /// batch's prints so far.
+    ///
+    /// An order that saw none of the batch's changes but joined after its depletion queued behind a level that
+    /// already excluded the `explained` part, so only the rest of the print advances it. Any other print is
     /// [`Self::trade`].
     fn trade_in_batch(
         &self,
@@ -284,17 +294,29 @@ where
         explained: f64,
     ) {
         let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
-        match q.batch_decrease {
-            Some(mut seen) if timestamp <= seen.stamp => {
-                seen.later_trades += qty;
-                q.front_q_qty = seen.front_before - seen.later_trades;
-                q.cum_trade_qty = seen.cum_trade_before + seen.later_trades;
-                self.depth(order, seen.prev_qty, seen.new_qty, depth);
-                let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
-                q.batch_decrease = Some(seen);
+        match q.batch.as_mut() {
+            Some(batch) if timestamp <= batch.stamp => {
+                // The print first, as `trade` then `is_filled` apply it.
+                batch.shadow_front -= qty;
+                batch.shadow_cum_trade += qty;
+                let exec = (-batch.shadow_front / depth.lot_size()).round() as i64;
+                let fill = if exec > 0 {
+                    batch.shadow_front = 0.0;
+                    (exec as f64) * depth.lot_size()
+                } else {
+                    0.0
+                };
+                // Then the batch's changes, net of its prints.
+                let (mut front, mut cum_trade) = (batch.shadow_front, batch.shadow_cum_trade);
+                for &(prev_qty, new_qty) in &batch.changes {
+                    self.apply_depth(&mut front, &mut cum_trade, prev_qty, new_qty);
+                }
+                q.front_q_qty = front;
+                q.cum_trade_qty = cum_trade;
+                q.batch_fill = Some(fill);
             }
             _ => {
-                q.batch_decrease = None;
+                q.batch = None;
                 let advance = qty - explained.clamp(0.0, qty);
                 if advance > 0.0 {
                     self.trade(order, advance, depth);
@@ -305,6 +327,10 @@ where
 
     fn is_filled(&self, order: &mut Order, depth: &MD) -> f64 {
         let q = order.q.as_any_mut().downcast_mut::<QueuePos>().unwrap();
+        // AB#3465 (gentilly): a print applied as of before its batch's changes fills what it fills there.
+        if let Some(fill) = q.batch_fill.take() {
+            return fill;
+        }
         let exec = (-q.front_q_qty / depth.lot_size()).round() as i64;
         if exec > 0 {
             q.front_q_qty = 0.0;
@@ -312,6 +338,43 @@ where
         } else {
             0.0
         }
+    }
+}
+
+impl<P, MD> ProbQueueModel<P, MD>
+where
+    P: Probability,
+{
+    /// The plain level-change update of a queue (`front_q_qty`, `cum_trade_qty`).
+    fn apply_depth(
+        &self,
+        front_q_qty: &mut f64,
+        cum_trade_qty: &mut f64,
+        prev_qty: f64,
+        new_qty: f64,
+    ) {
+        let mut chg = prev_qty - new_qty;
+        // In order to avoid duplicate order queue position adjustment, subtract queue position
+        // change by trades.
+        chg -= *cum_trade_qty;
+        // Reset, as quantity change by trade should be already reflected in qty.
+        *cum_trade_qty = 0.0;
+        // For an increase of the quantity, front queue doesn't change by the quantity change.
+        if chg < 0.0 {
+            *front_q_qty = front_q_qty.min(new_qty);
+            return;
+        }
+
+        let front = *front_q_qty;
+        let back = prev_qty - front;
+
+        let mut prob = self.prob.prob(front, back);
+        if prob.is_infinite() {
+            prob = 1.0;
+        }
+
+        let est_front = front - (1.0 - prob) * chg + (back - prob * chg).min(0.0);
+        *front_q_qty = est_front.min(new_qty);
     }
 }
 

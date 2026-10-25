@@ -2191,6 +2191,147 @@ mod ab3465_batch_depletion_exchange {
     }
 }
 
+/// AB#3465 (gentilly): the batch de-duplication is exact. A print reaching our order fills it, and leaves its queue,
+/// exactly as it would had it arrived before its publishing batch's level changes (the print-first feed, whose
+/// behaviour is unchanged), whatever the number of prints, changes and our orders at the level.
+#[cfg(test)]
+mod ab3465_batch_dedup_exact {
+    use crate::{
+        backtest::{
+            Backtest, DataSource, ExchangeKind, L2AssetBuilder,
+            assettype::LinearAsset,
+            data::Data,
+            models::{
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
+                TradingValueFeeModel,
+            },
+        },
+        depth::HashMapMarketDepth,
+        prelude::Bot,
+        types::*,
+    };
+
+    const STAMP: i64 = 50;
+    const LOT: f64 = 0.00001;
+
+    fn event(t: i64, ev: u64, px: f64, qty: f64, ival: i64) -> Event {
+        Event { ev: ev | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival, fval: 0.0 }
+    }
+
+    /// `ahead` rests at the ask 100 and our sells (`ours`, joining at t=3, 4, ...) queue behind it; at t=10 the
+    /// level grows to `level`. Then the batch stamped 50: buy prints `prints` at t=40, 41, ... and the level changes
+    /// to each of `changes` in turn, all before the prints (t=30, 31, ...) or all after them (t=45, 46, ...).
+    /// Our position, and each order's executed quantity.
+    fn run(ahead: f64, ours: &[f64], level: f64, prints: &[f64], changes: &[f64], changes_first: bool) -> (f64, Vec<f64>) {
+        let mut events = vec![
+            event(1, DEPTH_EVENT | BUY_EVENT, 98.0, 1.0, 0),
+            event(2, DEPTH_EVENT | SELL_EVENT, 100.0, ahead, 0),
+            event(3, 0, 0.0, 0.0, 0),
+        ];
+        for i in 0..ours.len() {
+            events.push(event(4 + i as i64, 0, 0.0, 0.0, 0));
+        }
+        events.push(event(10, DEPTH_EVENT | SELL_EVENT, 100.0, level, 10));
+        for (i, &q) in prints.iter().enumerate() {
+            events.push(event(40 + i as i64, TRADE_EVENT | BUY_EVENT, 100.0, q, 0));
+        }
+        let at = if changes_first { 30 } else { 45 };
+        for (i, &q) in changes.iter().enumerate() {
+            events.push(event(at + i as i64, DEPTH_EVENT | SELL_EVENT, 100.0, q, STAMP));
+        }
+        events.sort_by_key(|e| e.exch_ts);
+        events.push(event(60, 0, 0.0, 0.0, 0));
+        let asset = L2AssetBuilder::default()
+            .data(vec![DataSource::Data(Data::from_data(&events))])
+            .latency_model(ConstantLatency::new(0, 0))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(0.00004, 0.00028)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(0.5)))
+            .exchange(ExchangeKind::PartialFillExchange)
+            .depth(|| HashMapMarketDepth::new(1.0, LOT))
+            .build()
+            .unwrap();
+        let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
+        bt.elapse(3).unwrap();
+        for (i, &qty) in ours.iter().enumerate() {
+            bt.submit_sell_order(0, 1 + i as u64, 100.0, qty, TimeInForce::GTX, OrdType::Limit, false)
+                .unwrap();
+            bt.elapse(1).unwrap();
+        }
+        bt.elapse(60).unwrap();
+        let orders = bt.orders(0);
+        let executed = (0..ours.len())
+            .map(|i| orders.get(&(1 + i as u64)).map_or(ours[i], |o| o.exec_qty.max(ours[i] - o.leaves_qty)))
+            .collect();
+        (bt.position(0), executed)
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-12
+    }
+
+    /// The re-review's first case: 0.0004 ahead of our 0.001, 0.001 behind; a 0.0006 print takes the 0.0004 and
+    /// 0.0002 of ours, and the level shows 0.0008. Depletion first, the earlier fix rebuilt our queue negative, the
+    /// power probability of a negative ratio was NaN, and NaN.min put us at the back of the level: no fill.
+    #[test]
+    fn a_print_that_reaches_our_order_fills_it_in_either_order() {
+        let (print_first, _) = run(0.0004, &[0.001], 0.0014, &[0.0006], &[0.0008], false);
+        let (depletion_first, _) = run(0.0004, &[0.001], 0.0014, &[0.0006], &[0.0008], true);
+        assert!(near(print_first, -0.0002), "print first fills 0.0002, got {print_first}");
+        assert_eq!(depletion_first, print_first);
+    }
+
+    /// The re-review's second case: 0.0004 ahead, nobody behind, prints 0.0006 and 0.0003 and the level emptied.
+    /// Print first 0.0002 then 0.0003 fill; the earlier fix ignored the first fill's reset and filled 0.0007.
+    #[test]
+    fn several_prints_of_one_batch_fill_what_they_fill_print_first() {
+        let (print_first, _) = run(0.0004, &[0.001], 0.0004, &[0.0006, 0.0003], &[0.0], false);
+        let (depletion_first, _) = run(0.0004, &[0.001], 0.0004, &[0.0006, 0.0003], &[0.0], true);
+        assert!(near(print_first, -0.0005), "print first fills 0.0005, got {print_first}");
+        assert_eq!(depletion_first, print_first);
+    }
+
+    /// The phantom fill the de-duplication exists for (0.001 ahead, a 0.0006 print) stays absent with two of our
+    /// orders and a batch that changes the level twice.
+    #[test]
+    fn no_phantom_fill_with_two_orders_and_two_changes() {
+        for first in [false, true] {
+            let (position, _) = run(0.001, &[0.001, 0.0005], 0.002, &[0.0006], &[0.0016, 0.0014], first);
+            assert_eq!(position, 0.0, "changes first: {first}");
+        }
+    }
+
+    /// Exactness over many batches: random queues ahead and behind, one or two of our orders, one to three prints
+    /// and one to three level changes. Depletion first gives bit for bit the position and per-order executions that
+    /// print first gives.
+    #[test]
+    fn depletion_first_equals_print_first_bit_for_bit() {
+        let mut seed: u64 = 0x3465;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut reached = 0;
+        for _ in 0..3000 {
+            let ahead = next(300) as f64 * LOT;
+            let level = ahead + next(300) as f64 * LOT;
+            let ours: Vec<f64> = (0..1 + next(2)).map(|_| (1 + next(150)) as f64 * LOT).collect();
+            let prints: Vec<f64> = (0..1 + next(3)).map(|_| (1 + next(400)) as f64 * LOT).collect();
+            let changes: Vec<f64> = (0..1 + next(3)).map(|_| next(700) as f64 * LOT).collect();
+            let print_first = run(ahead, &ours, level, &prints, &changes, false);
+            let depletion_first = run(ahead, &ours, level, &prints, &changes, true);
+            assert_eq!(
+                depletion_first, print_first,
+                "ahead {ahead} level {level} ours {ours:?} prints {prints:?} changes {changes:?}"
+            );
+            if print_first.0 != 0.0 {
+                reached += 1;
+            }
+        }
+        assert!(reached > 300, "the prints reach our orders in many cases ({reached})");
+    }
+}
+
 /// AB#3465 (gentilly): a live simulator matching frames at receipt can apply a depth batch before a print it
 /// contains (the batch arrived first). The print then states its own execution time in `ival`, and the batch its send
 /// time, and the de-duplication works on those instead of the receipt clock.
