@@ -2190,3 +2190,66 @@ mod ab3465_batch_depletion_exchange {
         assert!(position(35, 38) < 0.0);
     }
 }
+
+/// AB#3465 (gentilly): a live simulator matching frames at receipt can apply a depth batch before a print it
+/// contains (the batch arrived first). The print then states its own execution time in `ival`, and the batch its send
+/// time, and the de-duplication works on those instead of the receipt clock.
+#[cfg(test)]
+mod ab3465_batch_depletion_receipt_clock {
+    use crate::{
+        backtest::{
+            Backtest, DataSource, ExchangeKind, L2AssetBuilder,
+            assettype::LinearAsset,
+            data::Data,
+            models::{
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
+                TradingValueFeeModel,
+            },
+        },
+        depth::HashMapMarketDepth,
+        prelude::Bot,
+        types::*,
+    };
+
+    fn event(t: i64, ev: u64, px: f64, qty: f64, ival: i64) -> Event {
+        Event { ev: ev | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival, fval: 0.0 }
+    }
+
+    /// Receipt order: the batch sent at 50 arrives at 52, the 0.0006 print executed at 49 arrives at 53.
+    fn position(trade_own_time: i64) -> f64 {
+        let events = vec![
+            event(1, DEPTH_EVENT | BUY_EVENT, 98.0, 1.0, 0),
+            event(2, DEPTH_EVENT | SELL_EVENT, 100.0, 0.001, 0),
+            event(3, 0, 0.0, 0.0, 0),
+            event(52, DEPTH_EVENT | SELL_EVENT, 100.0, 0.0004, 50),
+            event(53, TRADE_EVENT | BUY_EVENT, 100.0, 0.0006, trade_own_time),
+            event(60, 0, 0.0, 0.0, 0),
+        ];
+        let asset = L2AssetBuilder::default()
+            .data(vec![DataSource::Data(Data::from_data(&events))])
+            .latency_model(ConstantLatency::new(0, 0))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(0.00004, 0.00028)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(0.5)))
+            .exchange(ExchangeKind::PartialFillExchange)
+            .depth(|| HashMapMarketDepth::new(1.0, 0.00001))
+            .build()
+            .unwrap();
+        let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
+        bt.elapse(3).unwrap();
+        bt.submit_sell_order(0, 1, 100.0, 0.001, TimeInForce::GTX, OrdType::Limit, false)
+            .unwrap();
+        bt.elapse(60).unwrap();
+        bt.position(0)
+    }
+
+    #[test]
+    fn a_print_stating_its_own_time_is_de_duplicated_against_a_batch_received_first() {
+        assert_eq!(position(49), 0.0);
+    }
+
+    #[test]
+    fn without_its_own_time_the_receipt_clock_cannot_tell() {
+        assert!(position(0) < 0.0, "matched at receipt 53 after the batch stamped 50: no de-duplication");
+    }
+}

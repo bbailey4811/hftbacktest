@@ -23,6 +23,13 @@ use crate::{
     },
 };
 
+/// AB#3465 (gentilly): a print's own execution time, which decides whether it belongs to a stamped depth batch. A
+/// feed that matches prints at another time (a live simulator applying frames at receipt) states the print's own time
+/// in `ival`; otherwise the matching time is the print's own time.
+fn trade_time(event: &Event) -> i64 {
+    if event.ival > 0 { event.ival } else { event.exch_ts }
+}
+
 /// AB#3465 (gentilly): how many ticks past the opposite best a crossed resting order is matched against.
 const MAX_CROSS_LEVELS: i64 = 1_000;
 
@@ -237,6 +244,7 @@ where
         price_tick: i64,
         qty: f64,
         timestamp: i64,
+        trade_time: i64,
     ) -> Result<(), BacktestError> {
         let mut budget = qty;
         // AB#3465: the part of this print its own publishing batch already took off the level before the print.
@@ -246,7 +254,7 @@ where
             &mut self.batch_decrease_bid
         };
         let explained = match level_decreases.get_mut(&price_tick) {
-            Some((stamp, unexplained)) if timestamp <= *stamp && *unexplained > 0.0 => {
+            Some((stamp, unexplained)) if trade_time <= *stamp && *unexplained > 0.0 => {
                 let explained = qty.min(*unexplained);
                 *unexplained -= explained;
                 explained
@@ -986,10 +994,10 @@ where
             self.match_crossing(Side::Buy, timestamp)?;
         } else if event.is(EXCH_BUY_TRADE_EVENT) {
             let price_tick = (event.px / self.depth.tick_size()).round() as i64;
-            self.match_trade(Side::Sell, price_tick, event.qty, event.exch_ts)?;
+            self.match_trade(Side::Sell, price_tick, event.qty, event.exch_ts, trade_time(event))?;
         } else if event.is(EXCH_SELL_TRADE_EVENT) {
             let price_tick = (event.px / self.depth.tick_size()).round() as i64;
-            self.match_trade(Side::Buy, price_tick, event.qty, event.exch_ts)?;
+            self.match_trade(Side::Buy, price_tick, event.qty, event.exch_ts, trade_time(event))?;
         }
 
         Ok(())
