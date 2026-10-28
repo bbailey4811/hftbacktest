@@ -159,6 +159,9 @@ where
     // AB#3465 (gentilly): per resting post-only order not yet settled, the latest book recorded before it arrived
     // (as of when, and whether it crossed the order).
     post_only_verdicts: HashMap<OrderId, (i64, bool)>,
+    // AB#3465 (gentilly): the latest time an event has been processed as of (a live adapter's law time); absent while
+    // no event has been processed as of an earlier time.
+    latest_as_of: Option<i64>,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -198,6 +201,7 @@ where
             arrived: Default::default(),
             as_of: None,
             post_only_verdicts: Default::default(),
+            latest_as_of: None,
         }
     }
 
@@ -635,7 +639,26 @@ where
     // response (`fill::<true>`), so the local processor can book each fill at
     // its own price; the final ack response then reports no new execution.
     fn ack_new(&mut self, order: &mut Order, timestamp: i64) -> Result<(), BacktestError> {
-        let acked = self.ack_new_order(order, timestamp);
+        // AB#3465 (gentilly): while events are processed as of earlier times, the book a post-only order meets on
+        // arrival may still change by events made before it that are applied after it: an order the book as applied
+        // crosses rests with that verdict (as of the latest time applied), and its first event at or after its
+        // arrival settles it (`settle_post_only_arrivals`).
+        let crossed_pending = self.latest_as_of.filter(|_| {
+            order.time_in_force == TimeInForce::GTX
+                && order.order_type == OrdType::Limit
+                && if order.side == Side::Buy {
+                    order.price_tick >= self.depth.best_ask_tick()
+                } else {
+                    order.price_tick <= self.depth.best_bid_tick()
+                }
+        });
+        let acked = self.ack_new_order(order, timestamp, crossed_pending.is_some());
+        if let Some(as_of) = crossed_pending {
+            if self.orders.borrow().contains_key(&order.order_id) {
+                self.post_only_verdicts
+                    .insert(order.order_id, (as_of, true));
+            }
+        }
         // AB#3465 (gentilly): a resting order stands on the exchange from the time it arrived.
         if self.orders.borrow().contains_key(&order.order_id) {
             self.arrived.insert(order.order_id, timestamp);
@@ -643,7 +666,12 @@ where
         acked
     }
 
-    fn ack_new_order(&mut self, order: &mut Order, timestamp: i64) -> Result<(), BacktestError> {
+    fn ack_new_order(
+        &mut self,
+        order: &mut Order,
+        timestamp: i64,
+        rest_crossed_post_only: bool,
+    ) -> Result<(), BacktestError> {
         if self.orders.borrow().contains_key(&order.order_id) {
             return Err(BacktestError::OrderIdExist);
         }
@@ -652,7 +680,7 @@ where
             match order.order_type {
                 OrdType::Limit => {
                     // Checks if the buy order price is greater than or equal to the current best ask.
-                    if order.price_tick >= self.depth.best_ask_tick() {
+                    if order.price_tick >= self.depth.best_ask_tick() && !rest_crossed_post_only {
                         match order.time_in_force {
                             TimeInForce::GTX => {
                                 order.status = Status::Expired;
@@ -797,7 +825,7 @@ where
             match order.order_type {
                 OrdType::Limit => {
                     // Checks if the sell order price is less than or equal to the current best bid.
-                    if order.price_tick <= self.depth.best_bid_tick() {
+                    if order.price_tick <= self.depth.best_bid_tick() && !rest_crossed_post_only {
                         match order.time_in_force {
                             TimeInForce::GTX => {
                                 order.status = Status::Expired;
@@ -1136,6 +1164,7 @@ where
         self.process_event(event)?;
         if let Some(as_of) = self.as_of {
             self.record_post_only_verdicts(as_of);
+            self.latest_as_of = Some(self.latest_as_of.map_or(as_of, |latest| latest.max(as_of)));
         }
         Ok(())
     }
