@@ -156,6 +156,9 @@ where
     // orders that stood by then are met by its trade or crossing.
     arrived: HashMap<OrderId, i64>,
     as_of: Option<i64>,
+    // AB#3465 (gentilly): per resting post-only order not yet settled, the latest book recorded before it arrived
+    // (as of when, and whether it crossed the order).
+    post_only_verdicts: HashMap<OrderId, (i64, bool)>,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -194,6 +197,7 @@ where
             batch_decrease_ask: Default::default(),
             arrived: Default::default(),
             as_of: None,
+            post_only_verdicts: Default::default(),
         }
     }
 
@@ -317,62 +321,74 @@ where
         Ok(())
     }
 
-    /// AB#3465 (gentilly): while an event is processed as of an earlier time, the opposite book it leaves stood on
-    /// the exchange from then. A resting post-only (GTX) order on `side` that arrived after that time, priced at or
-    /// through the opposite best, arrived on a book it crossed: the exchange rejected it on arrival, as
-    /// [`Self::ack_new`] expires a GTX order that crosses the book it meets. It is expired now, when the book it met
-    /// is first known, and never fills from that book. Orders that stood by then are left to
-    /// [`Self::match_crossing`].
-    fn expire_post_only_that_arrived_crossed(
-        &mut self,
-        side: Side,
-        timestamp: i64,
-    ) -> Result<(), BacktestError> {
-        let Some(as_of) = self.as_of else {
-            return Ok(());
-        };
-        let best = if side == Side::Sell {
-            self.depth.best_bid_tick()
-        } else {
-            self.depth.best_ask_tick()
-        };
-        if best == INVALID_MIN || best == INVALID_MAX {
-            return Ok(());
-        }
-        let ladder = if side == Side::Sell {
-            &self.sell_orders
-        } else {
-            &self.buy_orders
-        };
-        let crossed: Vec<OrderId> = {
-            let orders = self.orders.borrow();
-            ladder
-                .iter()
-                .filter(|(tick, _)| {
-                    if side == Side::Sell {
-                        **tick <= best
-                    } else {
-                        **tick >= best
+    /// AB#3465 (gentilly): while an event is processed as of an earlier time, the book it leaves stood on the
+    /// exchange from then. For each resting post-only (GTX) order that arrived after that time, whether that book
+    /// crosses it (its price at or through the opposite best) is its verdict as of then. A later such event (as of a
+    /// time still before the order arrived) overwrites it; an earlier one does not. The book the order met on arrival
+    /// is the one the latest of them left ([`Self::settle_post_only_arrivals`]).
+    fn record_post_only_verdicts(&mut self, as_of: i64) {
+        let best_ask = self.depth.best_ask_tick();
+        let best_bid = self.depth.best_bid_tick();
+        let orders = self.orders.borrow();
+        for (side, ladder) in [
+            (Side::Buy, &self.buy_orders),
+            (Side::Sell, &self.sell_orders),
+        ] {
+            for (tick, ids) in ladder {
+                let crossed = if side == Side::Buy {
+                    best_ask != INVALID_MAX && *tick >= best_ask
+                } else {
+                    best_bid != INVALID_MIN && *tick <= best_bid
+                };
+                for id in ids {
+                    if !self.arrived.get(id).is_some_and(|at| *at > as_of)
+                        || orders[id].time_in_force != TimeInForce::GTX
+                    {
+                        continue;
                     }
-                })
-                .flat_map(|(_, ids)| ids.iter().copied())
-                .filter(|id| self.arrived.get(id).is_some_and(|at| *at > as_of))
-                .filter(|id| orders[id].time_in_force == TimeInForce::GTX)
-                .collect()
-        };
-        for order_id in crossed {
+                    let verdict = self
+                        .post_only_verdicts
+                        .entry(*id)
+                        .or_insert((as_of, crossed));
+                    if verdict.0 <= as_of {
+                        *verdict = (as_of, crossed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// AB#3465 (gentilly): before an event as of `horizon` meets any order (a trade or a crossing), each resting
+    /// post-only order that arrived by `horizon` has met its book: if the latest book recorded before its arrival
+    /// ([`Self::record_post_only_verdicts`]) crossed it, the exchange rejected it on arrival, and it is expired now,
+    /// when that book is first known, never filling from it. An order no earlier book was recorded for met the book
+    /// it was accepted on.
+    fn settle_post_only_arrivals(&mut self, horizon: i64, timestamp: i64) {
+        if self.post_only_verdicts.is_empty() {
+            return;
+        }
+        let settled: Vec<(OrderId, bool)> = self
+            .post_only_verdicts
+            .iter()
+            .filter(|(id, _)| self.arrived.get(id).is_none_or(|at| *at <= horizon))
+            .map(|(id, (_, crossed))| (*id, *crossed))
+            .collect();
+        for (order_id, crossed) in settled {
+            self.post_only_verdicts.remove(&order_id);
+            if !crossed || !self.arrived.contains_key(&order_id) {
+                continue;
+            }
             let mut order = self
                 .orders
                 .borrow_mut()
                 .remove(&order_id)
-                .expect("AB#3465 a laddered order is resting");
+                .expect("AB#3465 an order with an arrival time is resting");
             self.arrived.remove(&order_id);
             self.unladder(order.side, order.price_tick, order_id);
             order.status = Status::Expired;
             order.exch_timestamp = timestamp;
             self.order_e2l.respond(order);
         }
-        Ok(())
     }
 
     /// AB#3465 (gentilly): the opposite book displays quantity at or through the price of our resting orders on
@@ -1000,7 +1016,7 @@ where
     }
 }
 
-impl<AT, LM, QM, MD, FM> Processor for PartialFillExchange<AT, LM, QM, MD, FM>
+impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
 where
     AT: AssetType,
     LM: LatencyModel,
@@ -1008,18 +1024,7 @@ where
     MD: MarketDepth + L2MarketDepth,
     FM: FeeModel,
 {
-    fn event_seen_timestamp(&self, event: &Event) -> Option<i64> {
-        event.is(EXCH_EVENT).then_some(event.exch_ts)
-    }
-
-    fn process_as_of(&mut self, event: &Event, as_of: i64) -> Result<(), BacktestError> {
-        self.as_of = Some(as_of);
-        let processed = self.process(event);
-        self.as_of = None;
-        processed
-    }
-
-    fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
+    fn process_event(&mut self, event: &Event) -> Result<(), BacktestError> {
         if event.is(EXCH_BID_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::Buy, event.px);
             self.consumed_bid.clear();
@@ -1064,7 +1069,6 @@ where
                 self.depth.bid_qty_at_tick(price_tick),
             );
             self.match_crossing(Side::Sell, timestamp)?;
-            self.expire_post_only_that_arrived_crossed(Side::Sell, timestamp)?;
         } else if event.is(EXCH_ASK_DEPTH_EVENT) || event.is(EXCH_ASK_DEPTH_SNAPSHOT_EVENT) {
             match self.ask_rebuild {
                 Some(None) => self.ask_rebuild = Some(Some(event.exch_ts)),
@@ -1095,7 +1099,6 @@ where
                 self.depth.ask_qty_at_tick(price_tick),
             );
             self.match_crossing(Side::Buy, timestamp)?;
-            self.expire_post_only_that_arrived_crossed(Side::Buy, timestamp)?;
         } else if event.is(EXCH_BUY_TRADE_EVENT) {
             let price_tick = (event.px / self.depth.tick_size()).round() as i64;
             self.match_trade(Side::Sell, price_tick, event.qty, event.exch_ts, trade_time(event))?;
@@ -1104,6 +1107,36 @@ where
             self.match_trade(Side::Buy, price_tick, event.qty, event.exch_ts, trade_time(event))?;
         }
 
+        Ok(())
+    }
+}
+
+impl<AT, LM, QM, MD, FM> Processor for PartialFillExchange<AT, LM, QM, MD, FM>
+where
+    AT: AssetType,
+    LM: LatencyModel,
+    QM: QueueModel<MD>,
+    MD: MarketDepth + L2MarketDepth,
+    FM: FeeModel,
+{
+    fn event_seen_timestamp(&self, event: &Event) -> Option<i64> {
+        event.is(EXCH_EVENT).then_some(event.exch_ts)
+    }
+
+    fn process_as_of(&mut self, event: &Event, as_of: i64) -> Result<(), BacktestError> {
+        self.as_of = Some(as_of);
+        let processed = self.process(event);
+        self.as_of = None;
+        processed
+    }
+
+    fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
+        // AB#3465 (gentilly): post-only orders that arrived by this event's time have met their book.
+        self.settle_post_only_arrivals(self.as_of.unwrap_or(event.exch_ts), event.exch_ts);
+        self.process_event(event)?;
+        if let Some(as_of) = self.as_of {
+            self.record_post_only_verdicts(as_of);
+        }
         Ok(())
     }
 
