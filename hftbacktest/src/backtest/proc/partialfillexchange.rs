@@ -317,6 +317,64 @@ where
         Ok(())
     }
 
+    /// AB#3465 (gentilly): while an event is processed as of an earlier time, the opposite book it leaves stood on
+    /// the exchange from then. A resting post-only (GTX) order on `side` that arrived after that time, priced at or
+    /// through the opposite best, arrived on a book it crossed: the exchange rejected it on arrival, as
+    /// [`Self::ack_new`] expires a GTX order that crosses the book it meets. It is expired now, when the book it met
+    /// is first known, and never fills from that book. Orders that stood by then are left to
+    /// [`Self::match_crossing`].
+    fn expire_post_only_that_arrived_crossed(
+        &mut self,
+        side: Side,
+        timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        let Some(as_of) = self.as_of else {
+            return Ok(());
+        };
+        let best = if side == Side::Sell {
+            self.depth.best_bid_tick()
+        } else {
+            self.depth.best_ask_tick()
+        };
+        if best == INVALID_MIN || best == INVALID_MAX {
+            return Ok(());
+        }
+        let ladder = if side == Side::Sell {
+            &self.sell_orders
+        } else {
+            &self.buy_orders
+        };
+        let crossed: Vec<OrderId> = {
+            let orders = self.orders.borrow();
+            ladder
+                .iter()
+                .filter(|(tick, _)| {
+                    if side == Side::Sell {
+                        **tick <= best
+                    } else {
+                        **tick >= best
+                    }
+                })
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .filter(|id| self.arrived.get(id).is_some_and(|at| *at > as_of))
+                .filter(|id| orders[id].time_in_force == TimeInForce::GTX)
+                .collect()
+        };
+        for order_id in crossed {
+            let mut order = self
+                .orders
+                .borrow_mut()
+                .remove(&order_id)
+                .expect("AB#3465 a laddered order is resting");
+            self.arrived.remove(&order_id);
+            self.unladder(order.side, order.price_tick, order_id);
+            order.status = Status::Expired;
+            order.exch_timestamp = timestamp;
+            self.order_e2l.respond(order);
+        }
+        Ok(())
+    }
+
     /// AB#3465 (gentilly): the opposite book displays quantity at or through the price of our resting orders on
     /// `side`. Each crossing level fills them, best price first, from the quantity it displays that has not already
     /// filled them, visiting levels from the most aggressive one down.
@@ -1006,6 +1064,7 @@ where
                 self.depth.bid_qty_at_tick(price_tick),
             );
             self.match_crossing(Side::Sell, timestamp)?;
+            self.expire_post_only_that_arrived_crossed(Side::Sell, timestamp)?;
         } else if event.is(EXCH_ASK_DEPTH_EVENT) || event.is(EXCH_ASK_DEPTH_SNAPSHOT_EVENT) {
             match self.ask_rebuild {
                 Some(None) => self.ask_rebuild = Some(Some(event.exch_ts)),
@@ -1036,6 +1095,7 @@ where
                 self.depth.ask_qty_at_tick(price_tick),
             );
             self.match_crossing(Side::Buy, timestamp)?;
+            self.expire_post_only_that_arrived_crossed(Side::Buy, timestamp)?;
         } else if event.is(EXCH_BUY_TRADE_EVENT) {
             let price_tick = (event.px / self.depth.tick_size()).round() as i64;
             self.match_trade(Side::Sell, price_tick, event.qty, event.exch_ts, trade_time(event))?;
