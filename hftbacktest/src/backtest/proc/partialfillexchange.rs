@@ -16,10 +16,11 @@ use crate::{
     depth::{INVALID_MAX, INVALID_MIN, L2MarketDepth, MarketDepth},
     prelude::OrdType,
     types::{
-        EXCH_ASK_DEPTH_CLEAR_EVENT, EXCH_ASK_DEPTH_EVENT, EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
-        EXCH_BID_DEPTH_CLEAR_EVENT, EXCH_BID_DEPTH_EVENT, EXCH_BID_DEPTH_SNAPSHOT_EVENT,
-        EXCH_BUY_TRADE_EVENT, EXCH_DEPTH_CLEAR_EVENT, EXCH_EVENT, EXCH_SELL_TRADE_EVENT, Event,
-        Order, OrderId, Side, Status, TimeInForce,
+        DEPTH_CLEAR_EVENT, DEPTH_EVENT, DEPTH_SNAPSHOT_EVENT, EXCH_ASK_DEPTH_CLEAR_EVENT,
+        EXCH_ASK_DEPTH_EVENT, EXCH_ASK_DEPTH_SNAPSHOT_EVENT, EXCH_BID_DEPTH_CLEAR_EVENT,
+        EXCH_BID_DEPTH_EVENT, EXCH_BID_DEPTH_SNAPSHOT_EVENT, EXCH_BUY_TRADE_EVENT,
+        EXCH_DEPTH_CLEAR_EVENT, EXCH_EVENT, EXCH_SELL_TRADE_EVENT, Event, Order, OrderId, Side,
+        Status, TimeInForce,
     },
 };
 
@@ -28,6 +29,16 @@ use crate::{
 /// in `ival`; otherwise the matching time is the print's own time.
 fn trade_time(event: &Event) -> i64 {
     if event.ival > 0 { event.ival } else { event.exch_ts }
+}
+
+/// AB#3465 (gentilly): an event that changes the exchange's book (a level, a snapshot level or a clear), as opposed to
+/// a trade or a bare clock event.
+fn is_book_event(event: &Event) -> bool {
+    event.ev & EXCH_EVENT != 0
+        && matches!(
+            event.ev & 0xff,
+            DEPTH_EVENT | DEPTH_CLEAR_EVENT | DEPTH_SNAPSHOT_EVENT
+        )
 }
 
 /// AB#3465 (gentilly): how many ticks past the opposite best a crossed resting order is matched against.
@@ -162,6 +173,10 @@ where
     // AB#3465 (gentilly): the latest time an event has been processed as of (a live adapter's law time); absent while
     // no event has been processed as of an earlier time.
     latest_as_of: Option<i64>,
+    // AB#3465 (gentilly): taker (IOC/FOK) orders that reached the exchange while events are processed as of earlier
+    // times and have not met the book yet, with their arrival times, in arrival order. Each meets the book its first
+    // book event at or after its arrival finds, before that event applies ([`Self::settle_arrivals`]).
+    waiting_takers: Vec<(i64, Order)>,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -202,6 +217,7 @@ where
             as_of: None,
             post_only_verdicts: Default::default(),
             latest_as_of: None,
+            waiting_takers: Vec::new(),
         }
     }
 
@@ -329,7 +345,7 @@ where
     /// exchange from then. For each resting post-only (GTX) order that arrived after that time, whether that book
     /// crosses it (its price at or through the opposite best) is its verdict as of then. A later such event (as of a
     /// time still before the order arrived) overwrites it; an earlier one does not. The book the order met on arrival
-    /// is the one the latest of them left ([`Self::settle_post_only_arrivals`]).
+    /// is the one the latest of them left ([`Self::settle_post_only`]).
     fn record_post_only_verdicts(&mut self, as_of: i64) {
         let best_ask = self.depth.best_ask_tick();
         let best_bid = self.depth.best_bid_tick();
@@ -362,37 +378,104 @@ where
         }
     }
 
-    /// AB#3465 (gentilly): before an event as of `horizon` meets any order (a trade or a crossing), each resting
-    /// post-only order that arrived by `horizon` has met its book: if the latest book recorded before its arrival
-    /// ([`Self::record_post_only_verdicts`]) crossed it, the exchange rejected it on arrival, and it is expired now,
-    /// when that book is first known, never filling from it. An order no earlier book was recorded for met the book
-    /// it was accepted on.
-    fn settle_post_only_arrivals(&mut self, horizon: i64, timestamp: i64) {
-        if self.post_only_verdicts.is_empty() {
-            return;
-        }
-        let settled: Vec<(OrderId, bool)> = self
+    /// AB#3465 (gentilly): the resting post-only orders not yet settled that arrived by `horizon` (an order no longer
+    /// resting has no arrival time and is due at once), each with its arrival time and whether the latest book
+    /// recorded before it arrived ([`Self::record_post_only_verdicts`]) crossed it, in arrival order.
+    fn post_only_arrivals_due(&self, horizon: i64) -> Vec<(i64, OrderId, bool)> {
+        let mut due: Vec<(i64, OrderId, bool)> = self
             .post_only_verdicts
             .iter()
-            .filter(|(id, _)| self.arrived.get(id).is_none_or(|at| *at <= horizon))
-            .map(|(id, (_, crossed))| (*id, *crossed))
+            .filter_map(|(id, (_, crossed))| match self.arrived.get(id) {
+                None => Some((i64::MIN, *id, *crossed)),
+                Some(at) if *at <= horizon => Some((*at, *id, *crossed)),
+                Some(_) => None,
+            })
             .collect();
-        for (order_id, crossed) in settled {
-            self.post_only_verdicts.remove(&order_id);
-            if !crossed || !self.arrived.contains_key(&order_id) {
-                continue;
-            }
-            let mut order = self
-                .orders
-                .borrow_mut()
-                .remove(&order_id)
-                .expect("AB#3465 an order with an arrival time is resting");
-            self.arrived.remove(&order_id);
-            self.unladder(order.side, order.price_tick, order_id);
-            order.status = Status::Expired;
-            order.exch_timestamp = timestamp;
-            self.order_e2l.respond(order);
+        due.sort_unstable();
+        due
+    }
+
+    /// AB#3465 (gentilly): a resting post-only order has met its book: if the latest book recorded before its arrival
+    /// crossed it, the exchange rejected it on arrival, and it is expired now, when that book is first known, never
+    /// filling from it. An order no earlier book was recorded for met the book it was accepted on.
+    fn settle_post_only(&mut self, order_id: OrderId, crossed: bool, timestamp: i64) {
+        self.post_only_verdicts.remove(&order_id);
+        if !crossed || !self.arrived.contains_key(&order_id) {
+            return;
         }
+        let mut order = self
+            .orders
+            .borrow_mut()
+            .remove(&order_id)
+            .expect("AB#3465 an order with an arrival time is resting");
+        self.arrived.remove(&order_id);
+        self.unladder(order.side, order.price_tick, order_id);
+        order.status = Status::Expired;
+        order.exch_timestamp = timestamp;
+        self.order_e2l.respond(order);
+    }
+
+    /// AB#3465 (gentilly): a taker order that waited for its book meets it now: the book as applied, which holds
+    /// every event processed before this one. It is answered (its fills, or the cancel of what is left) at
+    /// `timestamp`, when that book is known.
+    fn match_waiting_taker(
+        &mut self,
+        mut order: Order,
+        timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        self.ack_new(&mut order, timestamp)?;
+        self.order_e2l.respond(order);
+        Ok(())
+    }
+
+    /// AB#3465 (gentilly): before an event as of `horizon` applies, the orders that arrived by `horizon` meet the book
+    /// they arrived on, in arrival order:
+    ///
+    /// - each resting post-only order ([`Self::settle_post_only`]), before the event meets any order (a trade or a
+    ///   crossing);
+    /// - when the event is a book event, each waiting taker order ([`Self::match_waiting_taker`]), against the book
+    ///   as applied: every book change made before the taker arrived that has been seen, and, while book events
+    ///   come in their own time order, none made after. A book change made before the taker arrived that is seen
+    ///   after this event never reaches it. A trade or a bare clock event changes no book, and a book change made
+    ///   before the taker arrived can still follow it, so neither matches a taker.
+    fn settle_arrivals(
+        &mut self,
+        horizon: i64,
+        timestamp: i64,
+        book_event: bool,
+    ) -> Result<(), BacktestError> {
+        let takers_due = if book_event {
+            self.waiting_takers
+                .iter()
+                .take_while(|(at, _)| *at <= horizon)
+                .count()
+        } else {
+            0
+        };
+        if takers_due == 0 && self.post_only_verdicts.is_empty() {
+            return Ok(());
+        }
+        let takers: Vec<(i64, Order)> = self.waiting_takers.drain(..takers_due).collect();
+        let mut takers = takers.into_iter().peekable();
+        let mut post_only = self.post_only_arrivals_due(horizon).into_iter().peekable();
+        loop {
+            let taker_first = match (takers.peek(), post_only.peek()) {
+                (None, None) => break,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some((taker_at, _)), Some((post_only_at, _, _))) => taker_at < post_only_at,
+            };
+            if taker_first {
+                let (_, order) = takers.next().expect("AB#3465 a waiting taker was peeked");
+                self.match_waiting_taker(order, timestamp)?;
+            } else {
+                let (_, order_id, crossed) = post_only
+                    .next()
+                    .expect("AB#3465 a post-only order was peeked");
+                self.settle_post_only(order_id, crossed, timestamp);
+            }
+        }
+        Ok(())
     }
 
     /// AB#3465 (gentilly): the opposite book displays quantity at or through the price of our resting orders on
@@ -642,7 +725,7 @@ where
         // AB#3465 (gentilly): while events are processed as of earlier times, the book a post-only order meets on
         // arrival may still change by events made before it that are applied after it: an order the book as applied
         // crosses rests with that verdict (as of the latest time applied), and its first event at or after its
-        // arrival settles it (`settle_post_only_arrivals`).
+        // arrival settles it (`settle_arrivals`).
         let crossed_pending = self.latest_as_of.filter(|_| {
             order.time_in_force == TimeInForce::GTX
                 && order.order_type == OrdType::Limit
@@ -1159,8 +1242,12 @@ where
     }
 
     fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
-        // AB#3465 (gentilly): post-only orders that arrived by this event's time have met their book.
-        self.settle_post_only_arrivals(self.as_of.unwrap_or(event.exch_ts), event.exch_ts);
+        // AB#3465 (gentilly): orders that arrived by this event's time have met their book, in arrival order.
+        self.settle_arrivals(
+            self.as_of.unwrap_or(event.exch_ts),
+            event.exch_ts,
+            is_book_event(event),
+        )?;
         self.process_event(event)?;
         if let Some(as_of) = self.as_of {
             self.record_post_only_verdicts(as_of);
@@ -1178,6 +1265,15 @@ where
             // Processes a new order.
             if order.req == Status::New {
                 order.req = Status::None;
+                // AB#3465 (gentilly): while events are processed as of earlier times, the book changes the exchange
+                // made before this taker arrived may not all have been applied yet: it waits for its book
+                // (`settle_arrivals`), unanswered until then.
+                if self.latest_as_of.is_some()
+                    && matches!(order.time_in_force, TimeInForce::IOC | TimeInForce::FOK)
+                {
+                    self.waiting_takers.push((timestamp, order));
+                    continue;
+                }
                 self.ack_new(&mut order, timestamp)?;
             }
             // Processes a cancel order.
