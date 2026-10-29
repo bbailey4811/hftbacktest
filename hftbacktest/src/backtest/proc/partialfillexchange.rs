@@ -1198,7 +1198,8 @@ where
     }
 
     /// AB#3465 (gentilly): the held top-of-book events no waiting taker's arrival precedes are applied now, at
-    /// `timestamp`, in the order received, each as of its own time.
+    /// `timestamp`, in the order received, each as of its own time and, as every event, only after the orders that
+    /// arrived by then have met their book (`settle_arrivals`).
     fn release_top_of_book(&mut self, timestamp: i64) -> Result<(), BacktestError> {
         if self.held_top_of_book.is_empty() {
             return Ok(());
@@ -1211,9 +1212,12 @@ where
         self.held_top_of_book = keep;
         let as_of = self.as_of;
         for (mut event, held_as_of) in release {
+            let horizon = held_as_of.unwrap_or(event.exch_ts);
             event.exch_ts = timestamp;
             self.as_of = held_as_of;
-            let applied = self.apply_event(&event);
+            let applied = self
+                .settle_arrivals(horizon, timestamp, false)
+                .and_then(|()| self.apply_event(&event));
             self.as_of = as_of;
             applied?;
         }
@@ -1460,5 +1464,105 @@ mod own_fill_depletion_tests {
         let mut consumed = taken(0.03);
         own_fills_after_level_update(&mut consumed, true, 834_124, 0.0);
         assert!(consumed.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod top_of_book_release_tests {
+    use super::PartialFillExchange;
+    use crate::{
+        backtest::{
+            assettype::LinearAsset,
+            models::{CommonFees, ConstantLatency, RiskAdverseQueueModel, TradingValueFeeModel},
+            order::order_bus,
+            proc::Processor,
+            state::State,
+        },
+        depth::HashMapMarketDepth,
+        prelude::OrdType,
+        types::{
+            EXCH_ASK_DEPTH_EVENT, EXCH_BID_DEPTH_EVENT, Event, Order, Side, Status,
+            TOP_OF_BOOK_FEED_EVENT, TimeInForce,
+        },
+    };
+
+    fn depth(ev: u64, received: i64, px: f64, qty: f64) -> Event {
+        Event {
+            ev,
+            exch_ts: received,
+            local_ts: received,
+            px,
+            qty,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }
+    }
+
+    fn order(id: u64, price_tick: i64, tif: TimeInForce, sent: i64) -> Order {
+        let mut order = Order::new(id, price_tick, 0.1, 0.001, Side::Buy, OrdType::Limit, tif);
+        order.req = Status::New;
+        order.local_timestamp = sent;
+        order
+    }
+
+    /// A held top-of-book event, once released, first settles the post-only orders that arrived by its own time,
+    /// as every event does. Exchange-level: a Backtest delivers each order to the exchange before any event received
+    /// after its arrival, so it never hands over the post-only order below after the ticker; the release must still
+    /// not depend on that. An IOC arrives at 100; a ticker made at 130 (restating the 100.1 ask) is held; a post-only
+    /// bid at 100.1 arrives at 120 on a book crossing it; a book delta made at 110 matches the IOC and releases the
+    /// ticker. The bid arrived on an ask through it: rejected, never filled by the released ticker's crossing.
+    #[test]
+    fn a_released_top_of_book_event_settles_the_post_only_orders_that_arrived_by_its_time_first() {
+        let (exch_bus, mut local_bus) = order_bus(ConstantLatency::new(0, 0));
+        let mut exch = PartialFillExchange::new(
+            HashMapMarketDepth::new(0.1, 0.001),
+            State::new(
+                LinearAsset::new(1.0),
+                TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)),
+            ),
+            RiskAdverseQueueModel::new(),
+            exch_bus,
+        );
+        exch.process(&depth(EXCH_BID_DEPTH_EVENT, 1, 99.9, 1.0))
+            .unwrap();
+        exch.process(&depth(EXCH_ASK_DEPTH_EVENT, 1, 100.1, 1.0))
+            .unwrap();
+        // Events are processed as of earlier times from here.
+        exch.process_as_of(&depth(EXCH_ASK_DEPTH_EVENT, 50, 100.3, 1.0), 40)
+            .unwrap();
+        local_bus.request(order(1, 1010, TimeInForce::IOC, 100), |_| {});
+        exch.process_recv_order(100, None).unwrap();
+        exch.process_as_of(
+            &depth(
+                EXCH_ASK_DEPTH_EVENT | TOP_OF_BOOK_FEED_EVENT,
+                140,
+                100.1,
+                2.0,
+            ),
+            130,
+        )
+        .unwrap();
+        local_bus.request(order(2, 1001, TimeInForce::GTX, 120), |_| {});
+        exch.process_recv_order(120, None).unwrap();
+        exch.process_as_of(&depth(EXCH_BID_DEPTH_EVENT, 150, 99.8, 1.0), 110)
+            .unwrap();
+        let mut post_only = Vec::new();
+        while let Some(at) = local_bus.earliest_recv_order_timestamp() {
+            while let Some(response) = local_bus.receive(at) {
+                if response.order_id == 2 {
+                    post_only.push((response.status, response.exec_qty));
+                }
+            }
+        }
+        assert_eq!(
+            post_only.last().map(|(status, _)| *status),
+            Some(Status::Expired),
+            "{post_only:?}"
+        );
+        assert!(
+            post_only.iter().all(|(_, qty)| *qty == 0.0),
+            "the post-only bid filled from the released ticker: {post_only:?}"
+        );
     }
 }
