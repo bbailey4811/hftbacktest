@@ -16,11 +16,11 @@ use crate::{
     depth::{INVALID_MAX, INVALID_MIN, L2MarketDepth, MarketDepth},
     prelude::OrdType,
     types::{
-        DEPTH_CLEAR_EVENT, DEPTH_EVENT, DEPTH_SNAPSHOT_EVENT, EXCH_ASK_DEPTH_CLEAR_EVENT,
-        EXCH_ASK_DEPTH_EVENT, EXCH_ASK_DEPTH_SNAPSHOT_EVENT, EXCH_BID_DEPTH_CLEAR_EVENT,
-        EXCH_BID_DEPTH_EVENT, EXCH_BID_DEPTH_SNAPSHOT_EVENT, EXCH_BUY_TRADE_EVENT,
-        EXCH_DEPTH_CLEAR_EVENT, EXCH_EVENT, EXCH_SELL_TRADE_EVENT, Event, Order, OrderId, Side,
-        Status, TimeInForce,
+        BUY_EVENT, DEPTH_CLEAR_EVENT, DEPTH_EVENT, DEPTH_SNAPSHOT_EVENT,
+        EXCH_ASK_DEPTH_CLEAR_EVENT, EXCH_ASK_DEPTH_EVENT, EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+        EXCH_BID_DEPTH_CLEAR_EVENT, EXCH_BID_DEPTH_EVENT, EXCH_BID_DEPTH_SNAPSHOT_EVENT,
+        EXCH_BUY_TRADE_EVENT, EXCH_DEPTH_CLEAR_EVENT, EXCH_EVENT, EXCH_SELL_TRADE_EVENT, Event,
+        Order, OrderId, SELL_EVENT, Side, Status, TOP_OF_BOOK_FEED_EVENT, TimeInForce,
     },
 };
 
@@ -39,6 +39,11 @@ fn is_book_event(event: &Event) -> bool {
             event.ev & 0xff,
             DEPTH_EVENT | DEPTH_CLEAR_EVENT | DEPTH_SNAPSHOT_EVENT
         )
+}
+
+/// AB#3465 (gentilly): an event restating the top of the book from a separate top-of-book stream.
+fn is_top_of_book_event(event: &Event) -> bool {
+    event.ev & TOP_OF_BOOK_FEED_EVENT != 0
 }
 
 /// AB#3465 (gentilly): how many ticks past the opposite best a crossed resting order is matched against.
@@ -177,6 +182,13 @@ where
     // times and have not met the book yet, with their arrival times, in arrival order. Each meets the book its first
     // book event at or after its arrival finds, before that event applies ([`Self::settle_arrivals`]).
     waiting_takers: Vec<(i64, Order)>,
+    // AB#3465 (gentilly): how long a waiting taker waits for its book event at most (exchange time after its arrival);
+    // then it meets the book as applied. Absent: it waits for its book event however long that takes.
+    taker_book_wait: Option<i64>,
+    // AB#3465 (gentilly): top-of-book events (`TOP_OF_BOOK_FEED_EVENT`) made at or after the oldest waiting taker's
+    // arrival, held back from this exchange until no taker that arrived by then waits, with the time each is
+    // processed as of, in the order received. A later event of the book stream at the same level supersedes one.
+    held_top_of_book: Vec<(Event, Option<i64>)>,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -218,6 +230,8 @@ where
             post_only_verdicts: Default::default(),
             latest_as_of: None,
             waiting_takers: Vec::new(),
+            taker_book_wait: None,
+            held_top_of_book: Vec::new(),
         }
     }
 
@@ -237,6 +251,14 @@ where
     /// forgets the whole side, and only IOC orders read or add to what was taken.
     pub fn with_own_fill_depletion_persists(mut self, enabled: bool) -> Self {
         self.own_fill_depletion_persists = enabled;
+        self
+    }
+
+    /// AB#3465 (gentilly): a taker order that waits for the book event of its arrival (while events are processed as
+    /// of earlier times) waits at most `wait` (exchange time after its arrival): the first event at or after that
+    /// time, a bare clock event included, matches it against the book as applied.
+    pub fn with_taker_book_wait(mut self, wait: i64) -> Self {
+        self.taker_book_wait = Some(wait);
         self
     }
 
@@ -433,25 +455,30 @@ where
     ///
     /// - each resting post-only order ([`Self::settle_post_only`]), before the event meets any order (a trade or a
     ///   crossing);
-    /// - when the event is a book event, each waiting taker order ([`Self::match_waiting_taker`]), against the book
-    ///   as applied: every book change made before the taker arrived that has been seen, and, while book events
-    ///   come in their own time order, none made after. A book change made before the taker arrived that is seen
-    ///   after this event never reaches it. A trade or a bare clock event changes no book, and a book change made
-    ///   before the taker arrived can still follow it, so neither matches a taker.
+    /// - when the event is a book event of the book stream, each waiting taker order
+    ///   ([`Self::match_waiting_taker`]), against the book as applied: every book change made before the taker
+    ///   arrived that has been seen, and, while the book stream comes in its own time order, none made after (a
+    ///   top-of-book event made at or after its arrival is held back meanwhile). A book change made before the taker
+    ///   arrived that is seen after this event never reaches it. A trade or a bare clock event changes no book, and
+    ///   a book change made before the taker arrived can still follow it, so neither matches a taker, unless the
+    ///   taker has waited as long as it may (`taker_book_wait`).
     fn settle_arrivals(
         &mut self,
         horizon: i64,
         timestamp: i64,
         book_event: bool,
     ) -> Result<(), BacktestError> {
-        let takers_due = if book_event {
-            self.waiting_takers
-                .iter()
-                .take_while(|(at, _)| *at <= horizon)
-                .count()
-        } else {
-            0
-        };
+        // A taker that arrived by this time has waited for its book event as long as it may.
+        let waited_out = self
+            .taker_book_wait
+            .map(|wait| timestamp.saturating_sub(wait));
+        let takers_due = self
+            .waiting_takers
+            .iter()
+            .take_while(|(at, _)| {
+                (book_event && *at <= horizon) || waited_out.is_some_and(|by| *at <= by)
+            })
+            .count();
         if takers_due == 0 && self.post_only_verdicts.is_empty() {
             return Ok(());
         }
@@ -1135,6 +1162,62 @@ where
     MD: MarketDepth + L2MarketDepth,
     FM: FeeModel,
 {
+    /// AB#3465 (gentilly): an event applied to the book, and the post-only verdicts it leaves.
+    fn apply_event(&mut self, event: &Event) -> Result<(), BacktestError> {
+        self.process_event(event)?;
+        if let Some(as_of) = self.as_of {
+            self.record_post_only_verdicts(as_of);
+            self.latest_as_of = Some(self.latest_as_of.map_or(as_of, |latest| latest.max(as_of)));
+        }
+        Ok(())
+    }
+
+    /// AB#3465 (gentilly): a book-stream event received after held top-of-book events: the depth it sets at its level
+    /// replaces what a held one sets there, and a clear drops the held ones of its side.
+    fn supersede_held_top_of_book(&mut self, event: &Event) {
+        if self.held_top_of_book.is_empty() {
+            return;
+        }
+        let kind = event.ev & 0xff;
+        let buy = event.ev & BUY_EVENT != 0;
+        let sell = event.ev & SELL_EVENT != 0;
+        if kind == DEPTH_CLEAR_EVENT {
+            self.held_top_of_book.retain(|(held, _)| {
+                let held_buy = held.ev & BUY_EVENT != 0;
+                !((!buy && !sell) || (buy && held_buy) || (sell && !held_buy))
+            });
+        } else if matches!(kind, DEPTH_EVENT | DEPTH_SNAPSHOT_EVENT) {
+            let tick = (event.px / self.depth.tick_size()).round() as i64;
+            self.held_top_of_book.retain(|(held, _)| {
+                (held.ev & BUY_EVENT != 0) != buy
+                    || (held.px / self.depth.tick_size()).round() as i64 != tick
+            });
+        }
+    }
+
+    /// AB#3465 (gentilly): the held top-of-book events no waiting taker's arrival precedes are applied now, at
+    /// `timestamp`, in the order received, each as of its own time.
+    fn release_top_of_book(&mut self, timestamp: i64) -> Result<(), BacktestError> {
+        if self.held_top_of_book.is_empty() {
+            return Ok(());
+        }
+        let oldest = self.waiting_takers.first().map(|(arrived, _)| *arrived);
+        let held = std::mem::take(&mut self.held_top_of_book);
+        let (release, keep): (Vec<_>, Vec<_>) = held.into_iter().partition(|(event, as_of)| {
+            oldest.is_none_or(|arrived| as_of.unwrap_or(event.exch_ts) < arrived)
+        });
+        self.held_top_of_book = keep;
+        let as_of = self.as_of;
+        for (mut event, held_as_of) in release {
+            event.exch_ts = timestamp;
+            self.as_of = held_as_of;
+            let applied = self.apply_event(&event);
+            self.as_of = as_of;
+            applied?;
+        }
+        Ok(())
+    }
+
     fn process_event(&mut self, event: &Event) -> Result<(), BacktestError> {
         if event.is(EXCH_BID_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::Buy, event.px);
@@ -1242,18 +1325,26 @@ where
     }
 
     fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
+        let horizon = self.as_of.unwrap_or(event.exch_ts);
+        let top_of_book = is_top_of_book_event(event);
         // AB#3465 (gentilly): orders that arrived by this event's time have met their book, in arrival order.
-        self.settle_arrivals(
-            self.as_of.unwrap_or(event.exch_ts),
-            event.exch_ts,
-            is_book_event(event),
-        )?;
-        self.process_event(event)?;
-        if let Some(as_of) = self.as_of {
-            self.record_post_only_verdicts(as_of);
-            self.latest_as_of = Some(self.latest_as_of.map_or(as_of, |latest| latest.max(as_of)));
+        self.settle_arrivals(horizon, event.exch_ts, is_book_event(event) && !top_of_book)?;
+        // AB#3465 (gentilly): a top-of-book event made at or after a waiting taker's arrival waits until the book
+        // stream has reached that arrival.
+        if top_of_book
+            && self
+                .waiting_takers
+                .first()
+                .is_some_and(|(arrived, _)| *arrived <= horizon)
+        {
+            self.held_top_of_book.push((event.clone(), self.as_of));
+            return Ok(());
         }
-        Ok(())
+        if !top_of_book {
+            self.supersede_held_top_of_book(event);
+        }
+        self.apply_event(event)?;
+        self.release_top_of_book(event.exch_ts)
     }
 
     fn process_recv_order(

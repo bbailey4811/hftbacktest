@@ -186,6 +186,11 @@ pub const EXCH_EVENT: u64 = 1 << 31;
 /// Indicates that it is a valid event to be handled by the local processor at the local timestamp.
 pub const LOCAL_EVENT: u64 = 1 << 30;
 
+/// (gentilly, AB#3465) Marks a depth event that restates the top of the book from a separate top-of-book stream (a
+/// ticker), rather than a change from the book stream itself. Combined with a depth event's flags; [`Event::is`] is
+/// unaffected by it.
+pub const TOP_OF_BOOK_FEED_EVENT: u64 = 1 << 27;
+
 /// Represents a combination of [`DEPTH_CLEAR_EVENT`], and [`LOCAL_EVENT`].
 pub const LOCAL_DEPTH_CLEAR_EVENT: u64 = DEPTH_CLEAR_EVENT | LOCAL_EVENT;
 
