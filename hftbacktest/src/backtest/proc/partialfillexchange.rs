@@ -16,7 +16,7 @@ use crate::{
     depth::{INVALID_MAX, INVALID_MIN, L2MarketDepth, MarketDepth},
     prelude::OrdType,
     types::{
-        BUY_EVENT, DEPTH_CLEAR_EVENT, DEPTH_EVENT, DEPTH_SNAPSHOT_EVENT,
+        BOOK_STREAM_MARK_EVENT, BUY_EVENT, DEPTH_CLEAR_EVENT, DEPTH_EVENT, DEPTH_SNAPSHOT_EVENT,
         EXCH_ASK_DEPTH_CLEAR_EVENT, EXCH_ASK_DEPTH_EVENT, EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
         EXCH_BID_DEPTH_CLEAR_EVENT, EXCH_BID_DEPTH_EVENT, EXCH_BID_DEPTH_SNAPSHOT_EVENT,
         EXCH_BUY_TRADE_EVENT, EXCH_DEPTH_CLEAR_EVENT, EXCH_EVENT, EXCH_SELL_TRADE_EVENT, Event,
@@ -31,14 +31,16 @@ fn trade_time(event: &Event) -> i64 {
     if event.ival > 0 { event.ival } else { event.exch_ts }
 }
 
-/// AB#3465 (gentilly): an event that changes the exchange's book (a level, a snapshot level or a clear), as opposed to
-/// a trade or a bare clock event.
+/// AB#3465 (gentilly): an event of the book stream: one that changes the exchange's book (a level, a snapshot level
+/// or a clear), or marks how far the book stream has reached (`BOOK_STREAM_MARK_EVENT`), as opposed to a trade or a
+/// bare clock event.
 fn is_book_event(event: &Event) -> bool {
     event.ev & EXCH_EVENT != 0
-        && matches!(
-            event.ev & 0xff,
-            DEPTH_EVENT | DEPTH_CLEAR_EVENT | DEPTH_SNAPSHOT_EVENT
-        )
+        && (event.ev & BOOK_STREAM_MARK_EVENT != 0
+            || matches!(
+                event.ev & 0xff,
+                DEPTH_EVENT | DEPTH_CLEAR_EVENT | DEPTH_SNAPSHOT_EVENT
+            ))
 }
 
 /// AB#3465 (gentilly): an event restating the top of the book from a separate top-of-book stream.

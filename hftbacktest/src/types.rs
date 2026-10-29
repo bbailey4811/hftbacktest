@@ -191,6 +191,11 @@ pub const LOCAL_EVENT: u64 = 1 << 30;
 /// unaffected by it.
 pub const TOP_OF_BOOK_FEED_EVENT: u64 = 1 << 27;
 
+/// (gentilly, AB#3465) Marks a bare exchange event (no depth, no trade) stating that the book stream has reached the
+/// time the event is processed as of: every book change made by then has been sent, whether or not any of it
+/// changed the depth this exchange holds.
+pub const BOOK_STREAM_MARK_EVENT: u64 = 1 << 26;
+
 /// Represents a combination of [`DEPTH_CLEAR_EVENT`], and [`LOCAL_EVENT`].
 pub const LOCAL_DEPTH_CLEAR_EVENT: u64 = DEPTH_CLEAR_EVENT | LOCAL_EVENT;
 
