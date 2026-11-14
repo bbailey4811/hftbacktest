@@ -243,7 +243,11 @@ where
             .get_mut(&order_id)
             .ok_or(BacktestError::OrderNotFound)?;
 
-        if order.req != Status::None {
+        // AB#3482 (gentilly): a cancel may follow its order's create while that create is still in flight. Requests
+        // reach the exchange in the order they were sent (same latency), so the exchange applies the create, then
+        // this cancel, as a venue applies two requests sent in turn on one connection; a cancel that finds no order
+        // (the create was rejected or filled first) is answered rejected.
+        if order.req != Status::None && order.req != Status::New {
             return Err(BacktestError::OrderRequestInProcess);
         }
 
