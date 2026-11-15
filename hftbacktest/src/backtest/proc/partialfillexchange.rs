@@ -151,6 +151,9 @@ where
     // With own-fill depletion: `false` (the default) forgets what we took from a level when the feed next updates
     // that level; `true` keeps it across feed updates until the feed empties the level.
     own_fill_depletion_persists: bool,
+    // AB#3482 (gentilly): `true` (the default) fills our resting orders from quantity the opposite book displays at
+    // or through their price (`match_crossing`); `false` leaves a resting order to fill from trades only.
+    displayed_crossing_fills: bool,
     consumed_bid: HashMap<i64, f64>,
     consumed_ask: HashMap<i64, f64>,
     // AB#3465 (gentilly): per price level of the opposite book, the quantity it displayed at or through our resting
@@ -219,6 +222,7 @@ where
             filled_orders: Default::default(),
             own_fill_depletion: false,
             own_fill_depletion_persists: false,
+            displayed_crossing_fills: true,
             consumed_bid: Default::default(),
             consumed_ask: Default::default(),
             crossed_bid: Default::default(),
@@ -253,6 +257,14 @@ where
     /// forgets the whole side, and only IOC orders read or add to what was taken.
     pub fn with_own_fill_depletion_persists(mut self, enabled: bool) -> Self {
         self.own_fill_depletion_persists = enabled;
+        self
+    }
+
+    /// AB#3482 (gentilly): whether a resting order fills when the recorded opposite book displays quantity at or
+    /// through its price with no trade there (the AB#3465 displayed-book crossing fills). On by default. Off, a
+    /// resting order fills from trades only; a post-only order arriving on a book through it is still rejected.
+    pub fn with_displayed_crossing_fills(mut self, enabled: bool) -> Self {
+        self.displayed_crossing_fills = enabled;
         self
     }
 
@@ -511,6 +523,9 @@ where
     /// `side`. Each crossing level fills them, best price first, from the quantity it displays that has not already
     /// filled them, visiting levels from the most aggressive one down.
     fn match_crossing(&mut self, side: Side, timestamp: i64) -> Result<(), BacktestError> {
+        if !self.displayed_crossing_fills {
+            return Ok(());
+        }
         let best = if side == Side::Sell {
             self.depth.best_bid_tick()
         } else {
@@ -1564,5 +1579,95 @@ mod top_of_book_release_tests {
             post_only.iter().all(|(_, qty)| *qty == 0.0),
             "the post-only bid filled from the released ticker: {post_only:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod displayed_crossing_fill_tests {
+    use super::PartialFillExchange;
+    use crate::{
+        backtest::{
+            assettype::LinearAsset,
+            models::{CommonFees, ConstantLatency, RiskAdverseQueueModel, TradingValueFeeModel},
+            order::order_bus,
+            proc::Processor,
+            state::State,
+        },
+        depth::HashMapMarketDepth,
+        prelude::OrdType,
+        types::{
+            EXCH_ASK_DEPTH_EVENT, EXCH_BID_DEPTH_EVENT, EXCH_SELL_TRADE_EVENT, Event, Order, Side,
+            Status, TimeInForce,
+        },
+    };
+
+    fn event(ev: u64, at: i64, px: f64, qty: f64) -> Event {
+        Event {
+            ev,
+            exch_ts: at,
+            local_ts: at,
+            px,
+            qty,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }
+    }
+
+    /// What a post-only bid of 0.1 resting at 100.0 has filled after the recorded ask comes down to its price with
+    /// no trade, and then after a sell trade of its whole size prints through it at 99.9.
+    fn resting_bid_fills(displayed_crossing_fills: bool) -> (f64, f64) {
+        let (exch_bus, mut local_bus) = order_bus(ConstantLatency::new(0, 0));
+        let mut exch = PartialFillExchange::new(
+            HashMapMarketDepth::new(0.1, 0.001),
+            State::new(
+                LinearAsset::new(1.0),
+                TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)),
+            ),
+            RiskAdverseQueueModel::new(),
+            exch_bus,
+        )
+        .with_displayed_crossing_fills(displayed_crossing_fills);
+        exch.process(&event(EXCH_BID_DEPTH_EVENT, 1, 99.9, 1.0))
+            .unwrap();
+        exch.process(&event(EXCH_ASK_DEPTH_EVENT, 1, 100.1, 1.0))
+            .unwrap();
+        let mut bid = Order::new(
+            1,
+            1000,
+            0.1,
+            0.1,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTX,
+        );
+        bid.req = Status::New;
+        bid.local_timestamp = 10;
+        local_bus.request(bid, |_| {});
+        exch.process_recv_order(10, None).unwrap();
+        let mut filled = || {
+            let mut qty = 0.0;
+            while let Some(at) = local_bus.earliest_recv_order_timestamp() {
+                while let Some(response) = local_bus.receive(at) {
+                    qty += response.exec_qty;
+                }
+            }
+            qty
+        };
+        exch.process(&event(EXCH_ASK_DEPTH_EVENT, 20, 100.0, 1.0))
+            .unwrap();
+        let by_the_book = filled();
+        exch.process(&event(EXCH_SELL_TRADE_EVENT, 30, 99.9, 0.1))
+            .unwrap();
+        let by_the_trade = filled();
+        (by_the_book, by_the_trade)
+    }
+
+    #[test]
+    fn ab3482_a_resting_order_fills_from_the_displayed_book_only_when_crossing_fills_are_on() {
+        // On (the default rule): the ask displayed at our price fills the whole bid, leaving the trade nothing.
+        assert_eq!(resting_bid_fills(true), (0.1, 0.0));
+        // Off: the displayed ask fills nothing; the trade printing through our price fills the bid.
+        assert_eq!(resting_bid_fills(false), (0.0, 0.1));
     }
 }

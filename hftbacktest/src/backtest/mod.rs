@@ -136,6 +136,7 @@ pub struct L2AssetBuilder<LM, AT, QM, MD, FM> {
     depth_builder: Option<Box<dyn Fn() -> MD>>,
     own_fill_depletion: bool,
     own_fill_depletion_persists: bool,
+    displayed_crossing_fills: bool,
 }
 
 impl<LM, AT, QM, MD, FM> L2AssetBuilder<LM, AT, QM, MD, FM>
@@ -161,6 +162,7 @@ where
             depth_builder: None,
             own_fill_depletion: false,
             own_fill_depletion_persists: false,
+            displayed_crossing_fills: true,
         }
     }
 
@@ -267,6 +269,15 @@ where
         }
     }
 
+    /// AB#3482 (gentilly): sets whether the [`PartialFillExchange`] fills a resting order when the recorded opposite
+    /// book displays quantity at or through its price with no trade there. The default value is `true`.
+    pub fn displayed_crossing_fills(self, displayed_crossing_fills: bool) -> Self {
+        Self {
+            displayed_crossing_fills,
+            ..self
+        }
+    }
+
     /// Builds an `Asset`.
     pub fn build(self) -> Result<Asset<dyn LocalProcessor<MD>, dyn Processor, Event>, BuildError> {
         let reader = if self.latency_offset == 0 {
@@ -345,7 +356,8 @@ where
                     order_e2l,
                 )
                 .with_own_fill_depletion(self.own_fill_depletion)
-                .with_own_fill_depletion_persists(self.own_fill_depletion_persists);
+                .with_own_fill_depletion_persists(self.own_fill_depletion_persists)
+                .with_displayed_crossing_fills(self.displayed_crossing_fills);
 
                 Ok(Asset {
                     local: Box::new(local),
