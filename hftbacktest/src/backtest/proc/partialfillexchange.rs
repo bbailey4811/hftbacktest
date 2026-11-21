@@ -206,8 +206,9 @@ where
     // AB#3493 (gentilly): levels (bid side, tick) whose held removal a later event replaced: the level emptied, so
     // what our own fills took there is forgotten when that level's next event applies.
     forget_on_apply: HashSet<(bool, i64)>,
-    // AB#3493 (gentilly): per level (bid side, tick), the time its latest applied event was made (as of).
-    level_as_of: HashMap<(bool, i64), i64>,
+    // AB#3493 (gentilly): per level (bid side, tick) the venue displays, the venue nonce of its latest applied event
+    // (a live adapter states it in `fval`; 0 = not stated). Dropped when the level empties or its side is cleared.
+    level_nonce: HashMap<(bool, i64), u64>,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -254,7 +255,7 @@ where
             held_top_of_book: Vec::new(),
             taker_release_at_stream_mark: false,
             forget_on_apply: HashSet::new(),
-            level_as_of: HashMap::new(),
+            level_nonce: HashMap::new(),
         }
     }
 
@@ -1312,18 +1313,23 @@ where
         } else if matches!(kind, DEPTH_EVENT | DEPTH_SNAPSHOT_EVENT) {
             let tick_size = self.depth.tick_size();
             let tick = (event.px / tick_size).round() as i64;
-            // AB#3493 (gentilly): a held clamp bounds a side, not one level: a change at one level leaves it. A
-            // superseded held removal still says the level emptied: what our fills took there is forgotten when
-            // the event replacing it applies.
+            let as_of = self.as_of.unwrap_or(event.exch_ts);
+            let release_at_mark = self.taker_release_at_stream_mark;
+            // AB#3493 (gentilly): a held clamp bounds a side, not one level: a change at one level leaves it. With
+            // release at stream marks, only a held event made at or after this one is replaced (this one, received
+            // later, is the level's state in the live view); one made before it stays, to apply first in its own
+            // time. A replaced held removal still says the level emptied: what our fills took there is forgotten
+            // when the event replacing it applies.
             let mut emptied = false;
-            self.held_top_of_book.retain(|(held, _)| {
+            self.held_top_of_book.retain(|(held, held_as_of)| {
                 let replaced = held.ev & 0xff != DEPTH_TOP_CLAMP_EVENT
                     && (held.ev & BUY_EVENT != 0) == buy
-                    && (held.px / tick_size).round() as i64 == tick;
+                    && (held.px / tick_size).round() as i64 == tick
+                    && (!release_at_mark || held_as_of.unwrap_or(held.exch_ts) >= as_of);
                 emptied |= replaced && held.qty == 0.0;
                 !replaced
             });
-            if emptied {
+            if emptied && release_at_mark {
                 self.forget_on_apply.insert((buy, tick));
             }
         }
@@ -1363,29 +1369,58 @@ where
     /// level the book stream has not removed stays (it may have been added after the ticker's state), and our
     /// own-fill memory is forgotten only where the book stream's removal applies, as for every removal.
     fn clamp_to_top(&mut self, event: &Event) -> Result<(), BacktestError> {
+        // The ticker's venue nonce: a clamp that states none proves nothing about the book stream's changes.
+        let clamp_nonce = event.fval as u64;
+        if clamp_nonce == 0 {
+            return Ok(());
+        }
         let tick_size = self.depth.tick_size();
         let bound = (event.px / tick_size).round() as i64;
         let bid = event.ev & BUY_EVENT != 0;
-        let clamp_as_of = self.as_of.unwrap_or(event.exch_ts);
         let held = std::mem::take(&mut self.held_top_of_book);
-        let level_as_of = &self.level_as_of;
-        let (removals, keep): (Vec<_>, Vec<_>) = held.into_iter().partition(|(held, _)| {
-            let tick = (held.px / tick_size).round() as i64;
-            held.ev & 0xff == DEPTH_EVENT
-                && held.ev & EXCH_EVENT != 0
-                && held.qty == 0.0
-                && (held.ev & BUY_EVENT != 0) == bid
+        let mut seen = HashSet::new();
+        let mut removals = Vec::new();
+        let mut keep = Vec::with_capacity(held.len());
+        for (held_event, held_as_of) in held {
+            let tick = (held_event.px / tick_size).round() as i64;
+            let level_event = held_event.ev & 0xff != DEPTH_TOP_CLAMP_EVENT
+                && held_event.ev & EXCH_EVENT != 0
+                && (held_event.ev & BUY_EVENT != 0) == bid;
+            // Only the first held event of its level (an earlier one applies first, in its own time), a removal of a
+            // level better than the ticker's top, last set by the venue no later than the ticker's nonce: the
+            // ticker's state did not have it, so it was removed by then. One set after the ticker's nonce (an add
+            // its state did not have yet) may still have stood when a later order arrived.
+            let proven = level_event
+                && seen.insert(tick)
+                && held_event.ev & 0xff == DEPTH_EVENT
+                && held_event.qty == 0.0
                 && if bid { tick > bound } else { tick < bound }
-                // Only a level that stood unchanged since before the ticker's time: one set after it (an add the
-                // ticker's state did not have yet) may still have stood when a later order arrived.
-                && level_as_of.get(&(bid, tick)).is_none_or(|set| *set <= clamp_as_of)
-        });
+                && self
+                    .level_nonce
+                    .get(&(bid, tick))
+                    .is_some_and(|set| *set <= clamp_nonce);
+            if proven {
+                removals.push(held_event);
+            } else {
+                if level_event {
+                    seen.insert(tick);
+                }
+                keep.push((held_event, held_as_of));
+            }
+        }
         self.held_top_of_book = keep;
-        for (mut removal, _) in removals {
+        for mut removal in removals {
             removal.exch_ts = event.exch_ts;
             self.apply_event(&removal)?;
         }
         Ok(())
+    }
+
+    /// AB#3493 (gentilly): a cleared side (`None`: both) keeps no level nonces or pending own-fill resets.
+    fn forget_level_bookkeeping(&mut self, bid: Option<bool>) {
+        let cleared = |side: bool| bid.is_none_or(|bid| bid == side);
+        self.level_nonce.retain(|(side, _), _| !cleared(*side));
+        self.forget_on_apply.retain(|(side, _)| !cleared(*side));
     }
 
     fn process_event(&mut self, event: &Event) -> Result<(), BacktestError> {
@@ -1393,16 +1428,19 @@ where
             self.depth.clear_depth(Side::Buy, event.px);
             self.consumed_bid.clear();
             self.bid_rebuild = Some(None);
+            self.forget_level_bookkeeping(Some(true));
         } else if event.is(EXCH_ASK_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::Sell, event.px);
             self.consumed_ask.clear();
             self.ask_rebuild = Some(None);
+            self.forget_level_bookkeeping(Some(false));
         } else if event.is(EXCH_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::None, 0.0);
             self.consumed_bid.clear();
             self.consumed_ask.clear();
             self.bid_rebuild = Some(None);
             self.ask_rebuild = Some(None);
+            self.forget_level_bookkeeping(None);
         } else if event.is(EXCH_BID_DEPTH_EVENT) || event.is(EXCH_BID_DEPTH_SNAPSHOT_EVENT) {
             match self.bid_rebuild {
                 Some(None) => self.bid_rebuild = Some(Some(event.exch_ts)),
@@ -1420,8 +1458,12 @@ where
                 self.depth
                     .update_bid_depth(event.px, event.qty, event.exch_ts);
             if self.taker_release_at_stream_mark {
-                let made = self.as_of.unwrap_or(event.exch_ts);
-                self.level_as_of.insert((true, price_tick), made);
+                if new_qty <= 0.0 {
+                    self.level_nonce.remove(&(true, price_tick));
+                } else if event.fval > 0.0 {
+                    self.level_nonce
+                        .insert((true, price_tick), event.fval as u64);
+                }
             }
             if self.forget_on_apply.remove(&(true, price_tick)) {
                 self.consumed_bid.remove(&price_tick);
@@ -1458,8 +1500,12 @@ where
                 self.depth
                     .update_ask_depth(event.px, event.qty, event.exch_ts);
             if self.taker_release_at_stream_mark {
-                let made = self.as_of.unwrap_or(event.exch_ts);
-                self.level_as_of.insert((false, price_tick), made);
+                if new_qty <= 0.0 {
+                    self.level_nonce.remove(&(false, price_tick));
+                } else if event.fval > 0.0 {
+                    self.level_nonce
+                        .insert((false, price_tick), event.fval as u64);
+                }
             }
             if self.forget_on_apply.remove(&(false, price_tick)) {
                 self.consumed_ask.remove(&price_tick);
@@ -1528,11 +1574,18 @@ where
         let horizon = self.as_of.unwrap_or(event.exch_ts);
         let top_of_book = is_top_of_book_event(event);
         let mark = event.ev & BOOK_STREAM_MARK_EVENT != 0;
-        let book_change = is_book_event(event) && !top_of_book && !mark;
+        // AB#3493 (gentilly): with release at stream marks, a clear (a venue snapshot follows) is never held: every
+        // waiting taker meets the book as applied first, and the snapshot rebuilds the book for all that follow.
+        let clear = event.ev & EXCH_EVENT != 0 && event.ev & 0xff == DEPTH_CLEAR_EVENT;
+        let book_change = is_book_event(event)
+            && !top_of_book
+            && !mark
+            && !(self.taker_release_at_stream_mark
+                && matches!(event.ev & 0xff, DEPTH_CLEAR_EVENT | DEPTH_SNAPSHOT_EVENT));
         // AB#3465 (gentilly): orders that arrived by this event's time have met their book, in arrival order.
-        // AB#3493 (gentilly): with release at stream marks, only a mark meets them.
+        // AB#3493 (gentilly): with release at stream marks, only a mark (or a clear) meets them.
         let meets = if self.taker_release_at_stream_mark {
-            mark
+            mark || clear
         } else {
             is_book_event(event) && !top_of_book
         };
@@ -1554,7 +1607,7 @@ where
             self.held_top_of_book.push((event.clone(), self.as_of));
             return Ok(());
         }
-        if mark {
+        if mark && self.taker_release_at_stream_mark {
             // AB#3493 (gentilly): the held events made before the mark apply before it records any verdict.
             self.release_top_of_book(event.exch_ts)?;
         }
@@ -1892,11 +1945,16 @@ mod top_of_book_clamp_tests {
     fn a_clamp_applies_the_held_removals_it_proves_and_nothing_else() {
         for clamped in [false, true] {
             let (mut exch, mut local_bus) = exchange();
-            exch.process(&event(EXCH_BID_DEPTH_EVENT, 1, 99.9, 1.0))
+            // The venue nonce of each event (`fval`): the book of nonce 1, the ticker of nonce 2, the batch of 3.
+            let at_nonce = |mut event: Event, nonce: f64| {
+                event.fval = nonce;
+                event
+            };
+            exch.process(&at_nonce(event(EXCH_BID_DEPTH_EVENT, 1, 99.9, 1.0), 1.0))
                 .unwrap();
-            exch.process(&event(EXCH_ASK_DEPTH_EVENT, 1, 100.1, 0.1))
+            exch.process(&at_nonce(event(EXCH_ASK_DEPTH_EVENT, 1, 100.1, 0.1), 1.0))
                 .unwrap();
-            exch.process(&event(EXCH_ASK_DEPTH_EVENT, 1, 100.2, 1.0))
+            exch.process(&at_nonce(event(EXCH_ASK_DEPTH_EVENT, 1, 100.2, 1.0), 1.0))
                 .unwrap();
             // Events are processed as of earlier times from here.
             exch.process_as_of(
@@ -1904,14 +1962,20 @@ mod top_of_book_clamp_tests {
                 40,
             )
             .unwrap();
-            let mut between = vec![(event(EXCH_ASK_DEPTH_EVENT, 150, 100.1, 0.0), 130)];
+            let mut between = vec![(
+                at_nonce(event(EXCH_ASK_DEPTH_EVENT, 150, 100.1, 0.0), 3.0),
+                130,
+            )];
             if clamped {
                 let clamp = |side: u64, px: f64| {
-                    event(
-                        EXCH_EVENT | side | DEPTH_TOP_CLAMP_EVENT | TOP_OF_BOOK_FEED_EVENT,
-                        160,
-                        px,
-                        0.0,
+                    at_nonce(
+                        event(
+                            EXCH_EVENT | side | DEPTH_TOP_CLAMP_EVENT | TOP_OF_BOOK_FEED_EVENT,
+                            160,
+                            px,
+                            0.0,
+                        ),
+                        2.0,
                     )
                 };
                 between.push((clamp(SELL_EVENT, 100.2), 90));
@@ -1956,6 +2020,71 @@ mod top_of_book_clamp_tests {
                 "the book stream never removed the 99.9 bid"
             );
         }
+    }
+
+    /// AB#3493 review: with two takers waiting, each meets the book of its own arrival. A held removal of the 100.1
+    /// ask (made at 130) is not replaced by a later-made re-add (150): the buy arriving at 140 meets no 100.1 ask,
+    /// and a buy after 150 meets the re-added one.
+    #[test]
+    fn each_waiting_taker_meets_the_held_changes_made_before_its_own_arrival() {
+        let (mut exch, mut local_bus) = exchange();
+        exch.process(&event(EXCH_BID_DEPTH_EVENT, 1, 99.9, 1.0))
+            .unwrap();
+        exch.process(&event(EXCH_ASK_DEPTH_EVENT, 1, 100.1, 0.1))
+            .unwrap();
+        exch.process(&event(EXCH_ASK_DEPTH_EVENT, 1, 100.2, 1.0))
+            .unwrap();
+        exch.process_as_of(
+            &event(EXCH_EVENT | BOOK_STREAM_MARK_EVENT, 50, 0.0, 0.0),
+            40,
+        )
+        .unwrap();
+        for (id, tick, at) in [(1, 1000, 100), (2, 1001, 140)] {
+            let mut order = Order::new(
+                id,
+                tick,
+                0.1,
+                0.1,
+                Side::Buy,
+                OrdType::Limit,
+                TimeInForce::IOC,
+            );
+            order.req = Status::New;
+            order.local_timestamp = at;
+            local_bus.request(order, |_| {});
+            exch.process_recv_order(at, None).unwrap();
+        }
+        exch.process_as_of(&event(EXCH_ASK_DEPTH_EVENT, 150, 100.1, 0.0), 130)
+            .unwrap();
+        exch.process_as_of(&event(EXCH_ASK_DEPTH_EVENT, 160, 100.1, 0.1), 150)
+            .unwrap();
+        exch.process_as_of(
+            &event(EXCH_EVENT | BOOK_STREAM_MARK_EVENT, 170, 0.0, 0.0),
+            145,
+        )
+        .unwrap();
+        let mut filled = std::collections::HashMap::new();
+        while let Some(due) = local_bus.earliest_recv_order_timestamp() {
+            while let Some(response) = local_bus.receive(due) {
+                filled.insert(response.order_id, 0.1 - response.leaves_qty);
+            }
+        }
+        assert_eq!(
+            filled.get(&2).copied(),
+            Some(0.0),
+            "the venue had no 100.1 ask at 140: {filled:?}"
+        );
+        let bought = ioc(
+            &mut exch,
+            &mut local_bus,
+            3,
+            Side::Buy,
+            1001,
+            200,
+            &[],
+            (220, 210),
+        );
+        assert_eq!(bought, vec![(1001, 0.1)], "the 100.1 ask was back from 150");
     }
 }
 
