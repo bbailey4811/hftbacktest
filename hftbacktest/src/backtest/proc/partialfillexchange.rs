@@ -17,11 +17,11 @@ use crate::{
     prelude::OrdType,
     types::{
         BOOK_STREAM_MARK_EVENT, BUY_EVENT, DEPTH_CLEAR_EVENT, DEPTH_EVENT, DEPTH_SNAPSHOT_EVENT,
-        DEPTH_TOP_CLAMP_EVENT,
-        EXCH_ASK_DEPTH_CLEAR_EVENT, EXCH_ASK_DEPTH_EVENT, EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
-        EXCH_BID_DEPTH_CLEAR_EVENT, EXCH_BID_DEPTH_EVENT, EXCH_BID_DEPTH_SNAPSHOT_EVENT,
-        EXCH_BUY_TRADE_EVENT, EXCH_DEPTH_CLEAR_EVENT, EXCH_EVENT, EXCH_SELL_TRADE_EVENT, Event,
-        Order, OrderId, SELL_EVENT, Side, Status, TOP_OF_BOOK_FEED_EVENT, TimeInForce,
+        DEPTH_TOP_CLAMP_EVENT, EXCH_ASK_DEPTH_CLEAR_EVENT, EXCH_ASK_DEPTH_EVENT,
+        EXCH_ASK_DEPTH_SNAPSHOT_EVENT, EXCH_BID_DEPTH_CLEAR_EVENT, EXCH_BID_DEPTH_EVENT,
+        EXCH_BID_DEPTH_SNAPSHOT_EVENT, EXCH_BUY_TRADE_EVENT, EXCH_DEPTH_CLEAR_EVENT, EXCH_EVENT,
+        EXCH_SELL_TRADE_EVENT, Event, Order, OrderId, SELL_EVENT, Side, Status,
+        TOP_OF_BOOK_FEED_EVENT, TimeInForce,
     },
 };
 
@@ -203,6 +203,11 @@ where
     // reaches its arrival, and every book event made at or after the oldest waiting taker's arrival is held back (in
     // `held_top_of_book`, with the top-of-book ones) until no taker that arrived by then waits.
     taker_release_at_stream_mark: bool,
+    // AB#3493 (gentilly): levels (bid side, tick) whose held removal a later event replaced: the level emptied, so
+    // what our own fills took there is forgotten when that level's next event applies.
+    forget_on_apply: HashSet<(bool, i64)>,
+    // AB#3493 (gentilly): per level (bid side, tick), the time its latest applied event was made (as of).
+    level_as_of: HashMap<(bool, i64), i64>,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -248,6 +253,8 @@ where
             taker_book_wait: None,
             held_top_of_book: Vec::new(),
             taker_release_at_stream_mark: false,
+            forget_on_apply: HashSet::new(),
+            level_as_of: HashMap::new(),
         }
     }
 
@@ -1303,13 +1310,22 @@ where
                 !((!buy && !sell) || (buy && held_buy) || (sell && !held_buy))
             });
         } else if matches!(kind, DEPTH_EVENT | DEPTH_SNAPSHOT_EVENT) {
-            let tick = (event.px / self.depth.tick_size()).round() as i64;
-            // AB#3493 (gentilly): a held clamp bounds a side, not one level: a change at one level leaves it.
+            let tick_size = self.depth.tick_size();
+            let tick = (event.px / tick_size).round() as i64;
+            // AB#3493 (gentilly): a held clamp bounds a side, not one level: a change at one level leaves it. A
+            // superseded held removal still says the level emptied: what our fills took there is forgotten when
+            // the event replacing it applies.
+            let mut emptied = false;
             self.held_top_of_book.retain(|(held, _)| {
-                held.ev & 0xff == DEPTH_TOP_CLAMP_EVENT
-                    || (held.ev & BUY_EVENT != 0) != buy
-                    || (held.px / self.depth.tick_size()).round() as i64 != tick
+                let replaced = held.ev & 0xff != DEPTH_TOP_CLAMP_EVENT
+                    && (held.ev & BUY_EVENT != 0) == buy
+                    && (held.px / tick_size).round() as i64 == tick;
+                emptied |= replaced && held.qty == 0.0;
+                !replaced
             });
+            if emptied {
+                self.forget_on_apply.insert((buy, tick));
+            }
         }
     }
 
@@ -1341,39 +1357,35 @@ where
     }
 
     /// AB#3493 (gentilly): a top-of-book stream states the venue's best on one side as of its time
-    /// ([`DEPTH_TOP_CLAMP_EVENT`]): each level this exchange still holds better than it is dropped, as the venue
-    /// had dropped it (the book-stream change that removed it may still be on its way, or held back). The queue
-    /// ahead of our resting orders at a dropped level leaves with it. What our own fills took from a level and what
-    /// of it crossed our orders stays: the level was not seen to empty, and the book-stream change that empties it
-    /// forgets them (a ticker that made the level whole again would let our takers fill twice from one quantity).
-    fn clamp_to_top(&mut self, event: &Event) {
+    /// ([`DEPTH_TOP_CLAMP_EVENT`]): no level better than it stood then. A held book-stream removal of such a level
+    /// (held because it was dated after a waiting taker's arrival: its batch reached a state the ticker stream had
+    /// not dated yet) was therefore made by then: it applies now, as of the clamp's time. Nothing else changes: a
+    /// level the book stream has not removed stays (it may have been added after the ticker's state), and our
+    /// own-fill memory is forgotten only where the book stream's removal applies, as for every removal.
+    fn clamp_to_top(&mut self, event: &Event) -> Result<(), BacktestError> {
         let tick_size = self.depth.tick_size();
         let bound = (event.px / tick_size).round() as i64;
-        if event.ev & BUY_EVENT != 0 {
-            while self.depth.best_bid_tick() != INVALID_MIN && self.depth.best_bid_tick() > bound {
-                let best = self.depth.best_bid_tick();
-                let (price_tick, _, now_best, prev_qty, new_qty, _) =
-                    self.depth
-                        .update_bid_depth(best as f64 * tick_size, 0.0, event.exch_ts);
-                assert!(
-                    price_tick == best && now_best < best,
-                    "AB#3493 a clamp drops the best bid {best} (bound {bound}); the depth now has {now_best}"
-                );
-                self.on_bid_qty_chg(price_tick, prev_qty, new_qty, 0);
-            }
-        } else {
-            while self.depth.best_ask_tick() != INVALID_MAX && self.depth.best_ask_tick() < bound {
-                let best = self.depth.best_ask_tick();
-                let (price_tick, _, now_best, prev_qty, new_qty, _) =
-                    self.depth
-                        .update_ask_depth(best as f64 * tick_size, 0.0, event.exch_ts);
-                assert!(
-                    price_tick == best && now_best > best,
-                    "AB#3493 a clamp drops the best ask {best} (bound {bound}); the depth now has {now_best}"
-                );
-                self.on_ask_qty_chg(price_tick, prev_qty, new_qty, 0);
-            }
+        let bid = event.ev & BUY_EVENT != 0;
+        let clamp_as_of = self.as_of.unwrap_or(event.exch_ts);
+        let held = std::mem::take(&mut self.held_top_of_book);
+        let level_as_of = &self.level_as_of;
+        let (removals, keep): (Vec<_>, Vec<_>) = held.into_iter().partition(|(held, _)| {
+            let tick = (held.px / tick_size).round() as i64;
+            held.ev & 0xff == DEPTH_EVENT
+                && held.ev & EXCH_EVENT != 0
+                && held.qty == 0.0
+                && (held.ev & BUY_EVENT != 0) == bid
+                && if bid { tick > bound } else { tick < bound }
+                // Only a level that stood unchanged since before the ticker's time: one set after it (an add the
+                // ticker's state did not have yet) may still have stood when a later order arrived.
+                && level_as_of.get(&(bid, tick)).is_none_or(|set| *set <= clamp_as_of)
+        });
+        self.held_top_of_book = keep;
+        for (mut removal, _) in removals {
+            removal.exch_ts = event.exch_ts;
+            self.apply_event(&removal)?;
         }
+        Ok(())
     }
 
     fn process_event(&mut self, event: &Event) -> Result<(), BacktestError> {
@@ -1407,6 +1419,14 @@ where
             let (price_tick, _prev_best_bid_tick, _best_bid_tick, prev_qty, new_qty, timestamp) =
                 self.depth
                     .update_bid_depth(event.px, event.qty, event.exch_ts);
+            if self.taker_release_at_stream_mark {
+                let made = self.as_of.unwrap_or(event.exch_ts);
+                self.level_as_of.insert((true, price_tick), made);
+            }
+            if self.forget_on_apply.remove(&(true, price_tick)) {
+                self.consumed_bid.remove(&price_tick);
+                self.crossed_bid.remove(&price_tick);
+            }
             own_fills_after_level_update(
                 &mut self.consumed_bid,
                 self.own_fill_depletion_persists,
@@ -1437,6 +1457,14 @@ where
             let (price_tick, _prev_best_ask_tick, _best_ask_tick, prev_qty, new_qty, timestamp) =
                 self.depth
                     .update_ask_depth(event.px, event.qty, event.exch_ts);
+            if self.taker_release_at_stream_mark {
+                let made = self.as_of.unwrap_or(event.exch_ts);
+                self.level_as_of.insert((false, price_tick), made);
+            }
+            if self.forget_on_apply.remove(&(false, price_tick)) {
+                self.consumed_ask.remove(&price_tick);
+                self.crossed_ask.remove(&price_tick);
+            }
             own_fills_after_level_update(
                 &mut self.consumed_ask,
                 self.own_fill_depletion_persists,
@@ -1452,7 +1480,7 @@ where
             );
             self.match_crossing(Side::Buy, timestamp)?;
         } else if event.ev & EXCH_EVENT != 0 && event.ev & 0xff == DEPTH_TOP_CLAMP_EVENT {
-            self.clamp_to_top(event);
+            self.clamp_to_top(event)?;
         } else if event.is(EXCH_BUY_TRADE_EVENT) {
             let price_tick = (event.px / self.depth.tick_size()).round() as i64;
             self.match_trade(
@@ -1511,20 +1539,24 @@ where
         self.settle_arrivals(horizon, event.exch_ts, meets)?;
         // AB#3465 (gentilly): a top-of-book event made at or after a waiting taker's arrival waits until the book
         // stream has reached that arrival. AB#3493 (gentilly): with release at stream marks, a book change too.
+        // AB#3493 (gentilly): with release at stream marks, held events are book changes too, and the event of a
+        // level received last is the one the live view holds: it replaces a held one of its level, whatever its
+        // stream and whether it is held itself.
+        if !top_of_book || self.taker_release_at_stream_mark {
+            self.supersede_held_top_of_book(event);
+        }
         if (top_of_book || (self.taker_release_at_stream_mark && book_change))
             && self
                 .waiting_takers
                 .first()
                 .is_some_and(|(arrived, _)| *arrived <= horizon)
         {
-            if !top_of_book {
-                self.supersede_held_top_of_book(event);
-            }
             self.held_top_of_book.push((event.clone(), self.as_of));
             return Ok(());
         }
-        if !top_of_book {
-            self.supersede_held_top_of_book(event);
+        if mark {
+            // AB#3493 (gentilly): the held events made before the mark apply before it records any verdict.
+            self.release_top_of_book(event.exch_ts)?;
         }
         self.apply_event(event)?;
         self.release_top_of_book(event.exch_ts)
@@ -1758,8 +1790,9 @@ mod top_of_book_clamp_tests {
         depth::HashMapMarketDepth,
         prelude::OrdType,
         types::{
-            DEPTH_TOP_CLAMP_EVENT, EXCH_ASK_DEPTH_EVENT, EXCH_BID_DEPTH_EVENT, EXCH_EVENT, Event,
-            Order, SELL_EVENT, Side, Status, TOP_OF_BOOK_FEED_EVENT, TimeInForce,
+            BOOK_STREAM_MARK_EVENT, BUY_EVENT, DEPTH_TOP_CLAMP_EVENT, EXCH_ASK_DEPTH_EVENT,
+            EXCH_BID_DEPTH_EVENT, EXCH_EVENT, Event, Order, SELL_EVENT, Side, Status,
+            TOP_OF_BOOK_FEED_EVENT, TimeInForce,
         },
     };
 
@@ -1776,15 +1809,18 @@ mod top_of_book_clamp_tests {
         }
     }
 
-    /// AB#3493: the venue's best ask, stated by a ticker, drops the asks the exchange still holds below it (their
-    /// removal still on its way in the book stream), and keeps what our own fills took from them: the same quantity
-    /// restated later fills us once only. Asks 100.1 x 0.1 and 100.2 x 1.0; we buy 0.1 at 100.1; a ticker says the
-    /// best ask is 100.2; a buy up to 100.1 fills nothing; the book stream restates 100.1 x 0.1 (the quantity we
-    /// took); a buy up to 100.1 fills nothing again; a buy up to 100.2 fills at 100.2.
-    #[test]
-    fn a_clamp_drops_the_levels_better_than_the_venue_best_and_keeps_what_we_took_from_them() {
-        let (exch_bus, mut local_bus) = order_bus(ConstantLatency::new(0, 0));
-        let mut exch = PartialFillExchange::new(
+    fn exchange() -> (
+        PartialFillExchange<
+            LinearAsset,
+            ConstantLatency,
+            RiskAdverseQueueModel<HashMapMarketDepth>,
+            HashMapMarketDepth,
+            TradingValueFeeModel<CommonFees>,
+        >,
+        crate::backtest::order::LocalToExch<ConstantLatency>,
+    ) {
+        let (exch_bus, local_bus) = order_bus(ConstantLatency::new(0, 0));
+        let exch = PartialFillExchange::new(
             HashMapMarketDepth::new(0.1, 0.001),
             State::new(
                 LinearAsset::new(1.0),
@@ -1794,48 +1830,132 @@ mod top_of_book_clamp_tests {
             exch_bus,
         )
         .with_own_fill_depletion(true)
-        .with_own_fill_depletion_persists(true);
-        exch.process(&event(EXCH_BID_DEPTH_EVENT, 1, 99.9, 1.0))
-            .unwrap();
-        exch.process(&event(EXCH_ASK_DEPTH_EVENT, 1, 100.1, 0.1))
-            .unwrap();
-        exch.process(&event(EXCH_ASK_DEPTH_EVENT, 1, 100.2, 1.0))
-            .unwrap();
-        let mut buy = |exch: &mut PartialFillExchange<_, _, _, _, _>, id: u64, tick: i64, at: i64| {
-            let mut order = Order::new(id, tick, 0.1, 0.1, Side::Buy, OrdType::Limit, TimeInForce::IOC);
-            order.req = Status::New;
-            order.local_timestamp = at;
-            local_bus.request(order, |_| {});
-            exch.process_recv_order(at, None).unwrap();
-            // Each level walked is its own response; the last one states what is left.
-            let mut responses = Vec::new();
-            while let Some(due) = local_bus.earliest_recv_order_timestamp() {
-                while let Some(response) = local_bus.receive(due) {
-                    responses.push(response);
-                }
-            }
-            let last = responses.last().expect("an IOC is answered");
-            let filled = ((0.1 - last.leaves_qty) * 1e3).round() / 1e3;
-            responses
-                .iter()
-                .find(|response| response.exec_qty > 0.0)
-                .map(|response| (response.exec_price_tick, filled))
-                .into_iter()
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(buy(&mut exch, 1, 1001, 10), vec![(1001, 0.1)]);
-        exch.process(&event(
-            EXCH_EVENT | SELL_EVENT | DEPTH_TOP_CLAMP_EVENT | TOP_OF_BOOK_FEED_EVENT,
-            20,
-            100.2,
-            0.0,
-        ))
+        .with_own_fill_depletion_persists(true)
+        .with_taker_release_at_stream_mark(true);
+        (exch, local_bus)
+    }
+
+    /// The fills (price tick, quantity) of an IOC of 0.1 the exchange receives at `at`, once a stream mark as of
+    /// `mark_as_of` (received at `mark_at`) lets it meet its book.
+    fn ioc(
+        exch: &mut PartialFillExchange<
+            LinearAsset,
+            ConstantLatency,
+            RiskAdverseQueueModel<HashMapMarketDepth>,
+            HashMapMarketDepth,
+            TradingValueFeeModel<CommonFees>,
+        >,
+        local_bus: &mut crate::backtest::order::LocalToExch<ConstantLatency>,
+        id: u64,
+        side: Side,
+        tick: i64,
+        at: i64,
+        between: &[(Event, i64)],
+        (mark_at, mark_as_of): (i64, i64),
+    ) -> Vec<(i64, f64)> {
+        let mut order = Order::new(id, tick, 0.1, 0.1, side, OrdType::Limit, TimeInForce::IOC);
+        order.req = Status::New;
+        order.local_timestamp = at;
+        local_bus.request(order, |_| {});
+        exch.process_recv_order(at, None).unwrap();
+        for (event, as_of) in between {
+            exch.process_as_of(event, *as_of).unwrap();
+        }
+        exch.process_as_of(
+            &event(EXCH_EVENT | BOOK_STREAM_MARK_EVENT, mark_at, 0.0, 0.0),
+            mark_as_of,
+        )
         .unwrap();
-        assert_eq!(buy(&mut exch, 2, 1001, 30), vec![], "the venue's best ask was 100.2");
-        exch.process(&event(EXCH_ASK_DEPTH_EVENT, 40, 100.1, 0.1))
+        let mut responses = Vec::new();
+        while let Some(due) = local_bus.earliest_recv_order_timestamp() {
+            while let Some(response) = local_bus.receive(due) {
+                responses.push(response);
+            }
+        }
+        let last = responses.last().expect("an IOC is answered");
+        let filled = ((0.1 - last.leaves_qty) * 1e3).round() / 1e3;
+        responses
+            .iter()
+            .find(|response| response.exec_qty > 0.0)
+            .map(|response| (response.exec_price_tick, filled))
+            .into_iter()
+            .collect()
+    }
+
+    /// AB#3493: a ticker stating the venue's best ask as of a time before a waiting buy arrived proves that the book
+    /// stream's held removal of a better ask (held: its batch was dated after the arrival) had been made by then: the
+    /// buy meets the venue's book without it. A clamp removes nothing the book stream has not removed: a bid it
+    /// bounds with no held removal still fills a sell. Asks 100.1 x 0.1 and 100.2 x 1.0, bid 99.9; a buy up to
+    /// 100.1 arrives at 100; the batch removing 100.1 is dated 130; the ticker (best ask 100.2 and best bid 99.8,
+    /// as of 90) arrives after it; the mark reaching 110 meets the buy.
+    #[test]
+    fn a_clamp_applies_the_held_removals_it_proves_and_nothing_else() {
+        for clamped in [false, true] {
+            let (mut exch, mut local_bus) = exchange();
+            exch.process(&event(EXCH_BID_DEPTH_EVENT, 1, 99.9, 1.0))
+                .unwrap();
+            exch.process(&event(EXCH_ASK_DEPTH_EVENT, 1, 100.1, 0.1))
+                .unwrap();
+            exch.process(&event(EXCH_ASK_DEPTH_EVENT, 1, 100.2, 1.0))
+                .unwrap();
+            // Events are processed as of earlier times from here.
+            exch.process_as_of(
+                &event(EXCH_EVENT | BOOK_STREAM_MARK_EVENT, 50, 0.0, 0.0),
+                40,
+            )
             .unwrap();
-        assert_eq!(buy(&mut exch, 3, 1001, 50), vec![], "we took the 0.1 at 100.1 already");
-        assert_eq!(buy(&mut exch, 4, 1002, 60), vec![(1002, 0.1)]);
+            let mut between = vec![(event(EXCH_ASK_DEPTH_EVENT, 150, 100.1, 0.0), 130)];
+            if clamped {
+                let clamp = |side: u64, px: f64| {
+                    event(
+                        EXCH_EVENT | side | DEPTH_TOP_CLAMP_EVENT | TOP_OF_BOOK_FEED_EVENT,
+                        160,
+                        px,
+                        0.0,
+                    )
+                };
+                between.push((clamp(SELL_EVENT, 100.2), 90));
+                between.push((clamp(BUY_EVENT, 99.8), 90));
+            }
+            let bought = ioc(
+                &mut exch,
+                &mut local_bus,
+                1,
+                Side::Buy,
+                1001,
+                100,
+                &between,
+                (170, 110),
+            );
+            if clamped {
+                assert_eq!(
+                    bought,
+                    vec![],
+                    "the venue's best ask was 100.2 when the buy arrived"
+                );
+            } else {
+                assert_eq!(
+                    bought,
+                    vec![(1001, 0.1)],
+                    "without the ticker, the removal is dated after the buy"
+                );
+            }
+            let sold = ioc(
+                &mut exch,
+                &mut local_bus,
+                2,
+                Side::Sell,
+                999,
+                200,
+                &[],
+                (220, 210),
+            );
+            assert_eq!(
+                sold,
+                vec![(999, 0.1)],
+                "the book stream never removed the 99.9 bid"
+            );
+        }
     }
 }
 
