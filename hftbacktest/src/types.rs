@@ -167,6 +167,12 @@ pub const DEPTH_SNAPSHOT_EVENT: u64 = 4;
 /// Indicates that the best bid and best ask update event is received.
 pub const DEPTH_BBO_EVENT: u64 = 5;
 
+/// (gentilly, AB#3493) Indicates that, as of the event's time, the venue's best price on one side was `px` (with
+/// [`BUY_EVENT`], its best bid; with [`SELL_EVENT`], its best ask): no level better than it stood. A top-of-book
+/// stream (a ticker) states it; an exchange drops the levels it still holds better than `px` and keeps what our own
+/// fills took from them. Exchange-only: a local depth takes the top-of-book stream's levels themselves.
+pub const DEPTH_TOP_CLAMP_EVENT: u64 = 6;
+
 /// Indicates that an order has been added to the order book.
 pub const ADD_ORDER_EVENT: u64 = 10;
 
