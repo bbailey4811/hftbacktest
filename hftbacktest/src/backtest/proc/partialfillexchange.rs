@@ -205,7 +205,7 @@ where
     taker_release_at_stream_mark: bool,
     // AB#3493 (gentilly): levels (bid side, tick) whose held removal a later event replaced: the level emptied, so
     // what our own fills took there is forgotten when that level's next event applies.
-    forget_on_apply: HashSet<(bool, i64)>,
+    forget_on_apply: HashMap<(bool, i64), i64>,
     // AB#3493 (gentilly): per level (bid side, tick) the venue displays, the venue nonce of its latest applied event
     // (a live adapter states it in `fval`; 0 = not stated). Dropped when the level empties or its side is cleared.
     level_nonce: HashMap<(bool, i64), u64>,
@@ -254,7 +254,7 @@ where
             taker_book_wait: None,
             held_top_of_book: Vec::new(),
             taker_release_at_stream_mark: false,
-            forget_on_apply: HashSet::new(),
+            forget_on_apply: HashMap::new(),
             level_nonce: HashMap::new(),
         }
     }
@@ -1330,7 +1330,8 @@ where
                 !replaced
             });
             if emptied && release_at_mark {
-                self.forget_on_apply.insert((buy, tick));
+                // Spent by the replacing event (made at `as_of`), not by an earlier-made one still held at the level.
+                self.forget_on_apply.insert((buy, tick), as_of);
             }
         }
     }
@@ -1420,7 +1421,7 @@ where
     fn forget_level_bookkeeping(&mut self, bid: Option<bool>) {
         let cleared = |side: bool| bid.is_none_or(|bid| bid == side);
         self.level_nonce.retain(|(side, _), _| !cleared(*side));
-        self.forget_on_apply.retain(|(side, _)| !cleared(*side));
+        self.forget_on_apply.retain(|(side, _), _| !cleared(*side));
     }
 
     fn process_event(&mut self, event: &Event) -> Result<(), BacktestError> {
@@ -1457,7 +1458,9 @@ where
             let (price_tick, _prev_best_bid_tick, _best_bid_tick, prev_qty, new_qty, timestamp) =
                 self.depth
                     .update_bid_depth(event.px, event.qty, event.exch_ts);
-            if self.taker_release_at_stream_mark {
+            if self.taker_release_at_stream_mark
+                && (event.fval > 0.0 || !self.level_nonce.is_empty())
+            {
                 if new_qty <= 0.0 {
                     self.level_nonce.remove(&(true, price_tick));
                 } else if event.fval > 0.0 {
@@ -1465,9 +1468,17 @@ where
                         .insert((true, price_tick), event.fval as u64);
                 }
             }
-            if self.forget_on_apply.remove(&(true, price_tick)) {
-                self.consumed_bid.remove(&price_tick);
-                self.crossed_bid.remove(&price_tick);
+            if !self.forget_on_apply.is_empty() {
+                let made = self.as_of.unwrap_or(event.exch_ts);
+                if self
+                    .forget_on_apply
+                    .get(&(true, price_tick))
+                    .is_some_and(|replaced_at| made >= *replaced_at)
+                {
+                    self.forget_on_apply.remove(&(true, price_tick));
+                    self.consumed_bid.remove(&price_tick);
+                    self.crossed_bid.remove(&price_tick);
+                }
             }
             own_fills_after_level_update(
                 &mut self.consumed_bid,
@@ -1499,7 +1510,9 @@ where
             let (price_tick, _prev_best_ask_tick, _best_ask_tick, prev_qty, new_qty, timestamp) =
                 self.depth
                     .update_ask_depth(event.px, event.qty, event.exch_ts);
-            if self.taker_release_at_stream_mark {
+            if self.taker_release_at_stream_mark
+                && (event.fval > 0.0 || !self.level_nonce.is_empty())
+            {
                 if new_qty <= 0.0 {
                     self.level_nonce.remove(&(false, price_tick));
                 } else if event.fval > 0.0 {
@@ -1507,9 +1520,17 @@ where
                         .insert((false, price_tick), event.fval as u64);
                 }
             }
-            if self.forget_on_apply.remove(&(false, price_tick)) {
-                self.consumed_ask.remove(&price_tick);
-                self.crossed_ask.remove(&price_tick);
+            if !self.forget_on_apply.is_empty() {
+                let made = self.as_of.unwrap_or(event.exch_ts);
+                if self
+                    .forget_on_apply
+                    .get(&(false, price_tick))
+                    .is_some_and(|replaced_at| made >= *replaced_at)
+                {
+                    self.forget_on_apply.remove(&(false, price_tick));
+                    self.consumed_ask.remove(&price_tick);
+                    self.crossed_ask.remove(&price_tick);
+                }
             }
             own_fills_after_level_update(
                 &mut self.consumed_ask,
