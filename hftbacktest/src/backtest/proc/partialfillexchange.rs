@@ -28,7 +28,11 @@ use crate::{
 /// feed that matches prints at another time (a live simulator applying frames at receipt) states the print's own time
 /// in `ival`; otherwise the matching time is the print's own time.
 fn trade_time(event: &Event) -> i64 {
-    if event.ival > 0 { event.ival } else { event.exch_ts }
+    if event.ival > 0 {
+        event.ival
+    } else {
+        event.exch_ts
+    }
 }
 
 /// AB#3465 (gentilly): an event of the book stream: one that changes the exchange's book (a level, a snapshot level
@@ -194,6 +198,10 @@ where
     // arrival, held back from this exchange until no taker that arrived by then waits, with the time each is
     // processed as of, in the order received. A later event of the book stream at the same level supersedes one.
     held_top_of_book: Vec<(Event, Option<i64>)>,
+    // AB#3493 (gentilly): a waiting taker meets its book only at a book-stream mark (`BOOK_STREAM_MARK_EVENT`) that
+    // reaches its arrival, and every book event made at or after the oldest waiting taker's arrival is held back (in
+    // `held_top_of_book`, with the top-of-book ones) until no taker that arrived by then waits.
+    taker_release_at_stream_mark: bool,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -238,6 +246,7 @@ where
             waiting_takers: Vec::new(),
             taker_book_wait: None,
             held_top_of_book: Vec::new(),
+            taker_release_at_stream_mark: false,
         }
     }
 
@@ -273,6 +282,16 @@ where
     /// time, a bare clock event included, matches it against the book as applied.
     pub fn with_taker_book_wait(mut self, wait: i64) -> Self {
         self.taker_book_wait = Some(wait);
+        self
+    }
+
+    /// AB#3493 (gentilly): a waiting taker meets its book only when the feed marks that its streams have reached its
+    /// arrival (`BOOK_STREAM_MARK_EVENT`), not at the first book change made at or after it: a live adapter whose
+    /// streams (book batches, top-of-book records) reach it at different delays marks how far all of them have
+    /// shown the venue. Book events made at or after a waiting taker's arrival are held back until it has met its
+    /// book, so it never meets a change made after it arrived. `taker_book_wait` still bounds the wait.
+    pub fn with_taker_release_at_stream_mark(mut self, enabled: bool) -> Self {
+        self.taker_release_at_stream_mark = enabled;
         self
     }
 
@@ -1316,10 +1335,22 @@ where
             self.match_crossing(Side::Buy, timestamp)?;
         } else if event.is(EXCH_BUY_TRADE_EVENT) {
             let price_tick = (event.px / self.depth.tick_size()).round() as i64;
-            self.match_trade(Side::Sell, price_tick, event.qty, event.exch_ts, trade_time(event))?;
+            self.match_trade(
+                Side::Sell,
+                price_tick,
+                event.qty,
+                event.exch_ts,
+                trade_time(event),
+            )?;
         } else if event.is(EXCH_SELL_TRADE_EVENT) {
             let price_tick = (event.px / self.depth.tick_size()).round() as i64;
-            self.match_trade(Side::Buy, price_tick, event.qty, event.exch_ts, trade_time(event))?;
+            self.match_trade(
+                Side::Buy,
+                price_tick,
+                event.qty,
+                event.exch_ts,
+                trade_time(event),
+            )?;
         }
 
         Ok(())
@@ -1348,16 +1379,27 @@ where
     fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
         let horizon = self.as_of.unwrap_or(event.exch_ts);
         let top_of_book = is_top_of_book_event(event);
+        let mark = event.ev & BOOK_STREAM_MARK_EVENT != 0;
+        let book_change = is_book_event(event) && !top_of_book && !mark;
         // AB#3465 (gentilly): orders that arrived by this event's time have met their book, in arrival order.
-        self.settle_arrivals(horizon, event.exch_ts, is_book_event(event) && !top_of_book)?;
+        // AB#3493 (gentilly): with release at stream marks, only a mark meets them.
+        let meets = if self.taker_release_at_stream_mark {
+            mark
+        } else {
+            is_book_event(event) && !top_of_book
+        };
+        self.settle_arrivals(horizon, event.exch_ts, meets)?;
         // AB#3465 (gentilly): a top-of-book event made at or after a waiting taker's arrival waits until the book
-        // stream has reached that arrival.
-        if top_of_book
+        // stream has reached that arrival. AB#3493 (gentilly): with release at stream marks, a book change too.
+        if (top_of_book || (self.taker_release_at_stream_mark && book_change))
             && self
                 .waiting_takers
                 .first()
                 .is_some_and(|(arrived, _)| *arrived <= horizon)
         {
+            if !top_of_book {
+                self.supersede_held_top_of_book(event);
+            }
             self.held_top_of_book.push((event.clone(), self.as_of));
             return Ok(());
         }

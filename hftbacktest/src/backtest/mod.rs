@@ -1619,12 +1619,29 @@ mod ab3465_review_cases {
     };
 
     fn ev(t: i64, e: u64, px: f64, qty: f64) -> Event {
-        Event { ev: e | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival: 0, fval: 0.0 }
+        Event {
+            ev: e | EXCH_EVENT | LOCAL_EVENT,
+            exch_ts: t,
+            local_ts: t,
+            px,
+            qty,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }
     }
-    fn bid(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | BUY_EVENT, px, q) }
-    fn ask(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | SELL_EVENT, px, q) }
-    fn buy_trade(t: i64, px: f64, q: f64) -> Event { ev(t, TRADE_EVENT | BUY_EVENT, px, q) }
-    fn sell_trade(t: i64, px: f64, q: f64) -> Event { ev(t, TRADE_EVENT | SELL_EVENT, px, q) }
+    fn bid(t: i64, px: f64, q: f64) -> Event {
+        ev(t, DEPTH_EVENT | BUY_EVENT, px, q)
+    }
+    fn ask(t: i64, px: f64, q: f64) -> Event {
+        ev(t, DEPTH_EVENT | SELL_EVENT, px, q)
+    }
+    fn buy_trade(t: i64, px: f64, q: f64) -> Event {
+        ev(t, TRADE_EVENT | BUY_EVENT, px, q)
+    }
+    fn sell_trade(t: i64, px: f64, q: f64) -> Event {
+        ev(t, TRADE_EVENT | SELL_EVENT, px, q)
+    }
 
     /// Book 98 / 102. `orders` = (id, is_buy, px, qty) GTX at t=3, then `later`. Returns (position, open order count).
     fn run(orders: &[(u64, bool, f64, f64)], later: &[Event]) -> (f64, usize) {
@@ -1645,9 +1662,11 @@ mod ab3465_review_cases {
         bt.elapse(3).unwrap();
         for &(id, b, px, q) in orders {
             if b {
-                bt.submit_buy_order(0, id, px, q, TimeInForce::GTX, OrdType::Limit, false).unwrap();
+                bt.submit_buy_order(0, id, px, q, TimeInForce::GTX, OrdType::Limit, false)
+                    .unwrap();
             } else {
-                bt.submit_sell_order(0, id, px, q, TimeInForce::GTX, OrdType::Limit, false).unwrap();
+                bt.submit_sell_order(0, id, px, q, TimeInForce::GTX, OrdType::Limit, false)
+                    .unwrap();
             }
         }
         bt.elapse(50).unwrap();
@@ -1655,23 +1674,40 @@ mod ab3465_review_cases {
         (bt.position(0), open)
     }
 
-    fn near(a: f64, b: f64) -> bool { (a - b).abs() < 1e-9 }
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
 
     // R1: a print through a crossed remainder fills it.
     #[test]
     fn r1_crossed_remainder_trade_through_near() {
-        let (p, _) = run(&[(1, false, 100.0, 1.0)], &[bid(10, 101.0, 0.2), buy_trade(11, 102.0, 0.1)]);
-        assert!(near(p, -0.3), "print at 102 through our 100 ask should fill 0.1 more; got {p}");
+        let (p, _) = run(
+            &[(1, false, 100.0, 1.0)],
+            &[bid(10, 101.0, 0.2), buy_trade(11, 102.0, 0.1)],
+        );
+        assert!(
+            near(p, -0.3),
+            "print at 102 through our 100 ask should fill 0.1 more; got {p}"
+        );
     }
     #[test]
     fn r1b_crossed_remainder_trade_through_far() {
-        let (p, _) = run(&[(1, false, 100.0, 1.0)], &[bid(10, 101.0, 0.2), buy_trade(11, 104.0, 0.1)]);
+        let (p, _) = run(
+            &[(1, false, 100.0, 1.0)],
+            &[bid(10, 101.0, 0.2), buy_trade(11, 104.0, 0.1)],
+        );
         assert!(near(p, -0.3), "got {p}");
     }
     #[test]
     fn r1c_buy_side_mirror() {
-        let (p, _) = run(&[(1, true, 100.0, 1.0)], &[ask(10, 99.0, 0.2), sell_trade(11, 98.0, 0.1)]);
-        assert!(near(p, 0.3), "print at 98 through our 100 bid should fill 0.1 more; got {p}");
+        let (p, _) = run(
+            &[(1, true, 100.0, 1.0)],
+            &[ask(10, 99.0, 0.2), sell_trade(11, 98.0, 0.1)],
+        );
+        assert!(
+            near(p, 0.3),
+            "print at 98 through our 100 bid should fill 0.1 more; got {p}"
+        );
     }
 
     // R2: crossing quantity that leaves and comes back fills again.
@@ -1679,22 +1715,36 @@ mod ab3465_review_cases {
     fn r2_recross_by_new_liquidity() {
         let (p, _) = run(
             &[(1, false, 100.0, 1.0)],
-            &[bid(10, 101.0, 0.2), bid(11, 101.0, 0.0), bid(12, 101.0, 0.2)],
+            &[
+                bid(10, 101.0, 0.2),
+                bid(11, 101.0, 0.0),
+                bid(12, 101.0, 0.2),
+            ],
         );
-        assert!(near(p, -0.4), "a second 0.2 bid crossing after the first left should fill 0.2; got {p}");
+        assert!(
+            near(p, -0.4),
+            "a second 0.2 bid crossing after the first left should fill 0.2; got {p}"
+        );
     }
 
     // R3: crossing quantity that grows without the best moving fills as it grows.
     #[test]
     fn r3_crossing_level_grows() {
-        let (p, _) = run(&[(1, false, 100.0, 1.0)], &[bid(10, 101.0, 0.2), bid(11, 101.0, 0.5)]);
+        let (p, _) = run(
+            &[(1, false, 100.0, 1.0)],
+            &[bid(10, 101.0, 0.2), bid(11, 101.0, 0.5)],
+        );
         assert!(near(p, -0.5), "crossing grew to 0.5; got {p}");
     }
     #[test]
     fn r3b_backlog_released_by_unrelated_tick() {
         let (p, _) = run(
             &[(1, false, 100.0, 1.0)],
-            &[bid(10, 101.0, 0.2), bid(11, 101.0, 0.5), bid(12, 102.0, 0.01)],
+            &[
+                bid(10, 101.0, 0.2),
+                bid(11, 101.0, 0.5),
+                bid(12, 102.0, 0.01),
+            ],
         );
         assert!(near(p, -0.51), "got {p}");
     }
@@ -1702,19 +1752,38 @@ mod ab3465_review_cases {
     // R4: one print or one crossing level is one budget across all our orders.
     #[test]
     fn r4_one_print_fills_two_own_orders() {
-        let (p, _) = run(&[(1, false, 100.0, 1.0), (2, false, 101.0, 1.0)], &[buy_trade(10, 102.0, 0.03)]);
-        assert!(near(p, -0.03), "a 0.03 taker fills 0.03 across our book; got {p}");
+        let (p, _) = run(
+            &[(1, false, 100.0, 1.0), (2, false, 101.0, 1.0)],
+            &[buy_trade(10, 102.0, 0.03)],
+        );
+        assert!(
+            near(p, -0.03),
+            "a 0.03 taker fills 0.03 across our book; got {p}"
+        );
     }
     #[test]
     fn r4b_one_crossing_level_fills_two_own_orders() {
-        let (p, _) = run(&[(1, false, 100.0, 1.0), (2, false, 101.0, 1.0)], &[bid(10, 101.0, 0.2)]);
-        assert!(near(p, -0.2), "a 0.2 crossing bid fills 0.2 across our book; got {p}");
+        let (p, _) = run(
+            &[(1, false, 100.0, 1.0), (2, false, 101.0, 1.0)],
+            &[bid(10, 101.0, 0.2)],
+        );
+        assert!(
+            near(p, -0.2),
+            "a 0.2 crossing bid fills 0.2 across our book; got {p}"
+        );
     }
 
     // R5: through-trade then a cross from the same seller's rest: should equal seller size (sanity, expected pass).
     #[test]
     fn r5_taker_rest_after_through_print() {
-        let (p, _) = run(&[(1, true, 100.0, 1.0)], &[sell_trade(10, 98.0, 0.3), bid(11, 98.0, 0.7), ask(12, 98.0, 0.2)]);
+        let (p, _) = run(
+            &[(1, true, 100.0, 1.0)],
+            &[
+                sell_trade(10, 98.0, 0.3),
+                bid(11, 98.0, 0.7),
+                ask(12, 98.0, 0.2),
+            ],
+        );
         assert!(near(p, 0.5), "got {p}");
     }
 
@@ -1723,7 +1792,12 @@ mod ab3465_review_cases {
     fn r6_clear_and_resnapshot() {
         let (p, _) = run(
             &[(1, false, 100.0, 1.0)],
-            &[bid(10, 101.0, 0.2), ev(11, DEPTH_CLEAR_EVENT | BUY_EVENT, 0.0, 0.0), bid(12, 98.0, 1.0), bid(12, 101.0, 0.2)],
+            &[
+                bid(10, 101.0, 0.2),
+                ev(11, DEPTH_CLEAR_EVENT | BUY_EVENT, 0.0, 0.0),
+                bid(12, 98.0, 1.0),
+                bid(12, 101.0, 0.2),
+            ],
         );
         assert!(near(p, -0.2), "got {p}");
     }
@@ -1739,7 +1813,9 @@ mod ab3465_review_cases {
     #[test]
     fn r8_exact_fill_then_more_prints() {
         let mut later = vec![];
-        for i in 0..12 { later.push(buy_trade(10 + i, 102.0, 0.1)); }
+        for i in 0..12 {
+            later.push(buy_trade(10 + i, 102.0, 0.1));
+        }
         let (p, open) = run(&[(1, false, 100.0, 1.0)], &later);
         assert!(near(p, -1.0) && open == 0, "got {p} open={open}");
     }
@@ -1749,7 +1825,12 @@ mod ab3465_review_cases {
     fn r9_cross_then_through_then_cross() {
         let (p, open) = run(
             &[(1, false, 100.0, 1.0)],
-            &[bid(10, 101.0, 0.6), buy_trade(11, 106.0, 0.4), bid(12, 101.0, 2.0), bid(13, 103.0, 2.0)],
+            &[
+                bid(10, 101.0, 0.6),
+                buy_trade(11, 106.0, 0.4),
+                bid(12, 101.0, 2.0),
+                bid(13, 103.0, 2.0),
+            ],
         );
         assert!(near(p, -1.0) && open == 0, "got {p} open={open}");
     }
@@ -1785,11 +1866,26 @@ mod ab3465_review2_cases {
     };
 
     fn ev(t: i64, e: u64, px: f64, qty: f64) -> Event {
-        Event { ev: e | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival: 0, fval: 0.0 }
+        Event {
+            ev: e | EXCH_EVENT | LOCAL_EVENT,
+            exch_ts: t,
+            local_ts: t,
+            px,
+            qty,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }
     }
-    fn bid(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | BUY_EVENT, px, q) }
-    fn ask(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | SELL_EVENT, px, q) }
-    fn buy_trade(t: i64, px: f64, q: f64) -> Event { ev(t, TRADE_EVENT | BUY_EVENT, px, q) }
+    fn bid(t: i64, px: f64, q: f64) -> Event {
+        ev(t, DEPTH_EVENT | BUY_EVENT, px, q)
+    }
+    fn ask(t: i64, px: f64, q: f64) -> Event {
+        ev(t, DEPTH_EVENT | SELL_EVENT, px, q)
+    }
+    fn buy_trade(t: i64, px: f64, q: f64) -> Event {
+        ev(t, TRADE_EVENT | BUY_EVENT, px, q)
+    }
 
     type Ord_ = (u64, bool, f64, f64, TimeInForce, i64); // id, buy, px, qty, tif, submit time
 
@@ -1816,36 +1912,52 @@ mod ab3465_review2_cases {
         let mut os = orders.to_vec();
         os.sort_by_key(|o| o.5);
         for (id, b, px, q, tif, t) in os {
-            if t > now { bt.elapse(t - now).unwrap(); now = t; }
+            if t > now {
+                bt.elapse(t - now).unwrap();
+                now = t;
+            }
             if b {
-                bt.submit_buy_order(0, id, px, q, tif, OrdType::Limit, false).unwrap();
+                bt.submit_buy_order(0, id, px, q, tif, OrdType::Limit, false)
+                    .unwrap();
             } else {
-                bt.submit_sell_order(0, id, px, q, tif, OrdType::Limit, false).unwrap();
+                bt.submit_sell_order(0, id, px, q, tif, OrdType::Limit, false)
+                    .unwrap();
             }
         }
         bt.elapse(100 - now).unwrap();
         let open = bt.orders(0).values().filter(|o| o.active()).count();
         (bt.position(0), open)
     }
-    fn near(a: f64, b: f64) -> bool { (a - b).abs() < 1e-9 }
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
 
     // N1: two of our orders at the print price each get the whole remaining budget through the queue model.
     #[test]
     fn n1_equal_price_budget_shared() {
         let (p, _) = run(
             &[ask(2, 100.0, 0.3)],
-            &[(1, false, 100.0, 1.0, TimeInForce::GTX, 3), (2, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[
+                (1, false, 100.0, 1.0, TimeInForce::GTX, 3),
+                (2, false, 100.0, 1.0, TimeInForce::GTX, 3),
+            ],
             &[buy_trade(10, 100.0, 0.8)],
             false,
         );
-        assert!(near(p, -0.5), "0.8 print, 0.3 real ahead: 0.5 left for our two orders; got {p}");
+        assert!(
+            near(p, -0.5),
+            "0.8 print, 0.3 real ahead: 0.5 left for our two orders; got {p}"
+        );
     }
     // N1 control: one order through + one at print price share the budget (expected pass).
     #[test]
     fn n1b_through_then_equal() {
         let (p, _) = run(
             &[ask(2, 100.0, 0.3)],
-            &[(1, false, 99.0, 0.4, TimeInForce::GTX, 3), (2, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[
+                (1, false, 99.0, 0.4, TimeInForce::GTX, 3),
+                (2, false, 100.0, 1.0, TimeInForce::GTX, 3),
+            ],
             &[buy_trade(10, 100.0, 0.8)],
             false,
         );
@@ -1866,7 +1978,10 @@ mod ab3465_review2_cases {
             ],
             false,
         );
-        assert!(near(p, -0.4), "new 0.2 at 101 after the old one vanished in the snapshot should fill; got {p}");
+        assert!(
+            near(p, -0.4),
+            "new 0.2 at 101 after the old one vanished in the snapshot should fill; got {p}"
+        );
     }
     // N2 control: clear + snapshot re-sending the same level must not refill (expected pass).
     #[test]
@@ -1891,11 +2006,17 @@ mod ab3465_review2_cases {
         for depletion in [true, false] {
             let (p, _) = run(
                 &[],
-                &[(1, true, 100.0, 1.0, TimeInForce::GTX, 3), (2, true, 99.0, 0.2, TimeInForce::IOC, 20)],
+                &[
+                    (1, true, 100.0, 1.0, TimeInForce::GTX, 3),
+                    (2, true, 99.0, 0.2, TimeInForce::IOC, 20),
+                ],
                 &[ask(10, 99.0, 0.2)],
                 depletion,
             );
-            assert!(near(p, 0.2), "depletion={depletion}: 0.2 displayed at 99 fills 0.2 across our orders; got {p}");
+            assert!(
+                near(p, 0.2),
+                "depletion={depletion}: 0.2 displayed at 99 fills 0.2 across our orders; got {p}"
+            );
         }
     }
     #[test]
@@ -1903,7 +2024,10 @@ mod ab3465_review2_cases {
         // IOC takes 0.2 at 99 at t=10 while our maker bid rests at 98.?; the maker is then crossed by an unrelated update.
         let (p, _) = run(
             &[ask(2, 99.0, 0.2)],
-            &[(2, true, 99.0, 0.2, TimeInForce::IOC, 3), (1, true, 98.0, 1.0, TimeInForce::GTX, 3)],
+            &[
+                (2, true, 99.0, 0.2, TimeInForce::IOC, 3),
+                (1, true, 98.0, 1.0, TimeInForce::GTX, 3),
+            ],
             &[ask(10, 98.0, 0.1)],
             true,
         );
@@ -1919,24 +2043,47 @@ mod ab3465_crossing_bench {
             Backtest, DataSource, ExchangeKind, L2AssetBuilder,
             assettype::LinearAsset,
             data::Data,
-            models::{CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel, TradingValueFeeModel},
+            models::{
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
+                TradingValueFeeModel,
+            },
         },
         depth::HashMapMarketDepth,
         prelude::Bot,
         types::*,
     };
     fn ev(t: i64, e: u64, px: f64, qty: f64) -> Event {
-        Event { ev: e | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival: 0, fval: 0.0 }
+        Event {
+            ev: e | EXCH_EVENT | LOCAL_EVENT,
+            exch_ts: t,
+            local_ts: t,
+            px,
+            qty,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }
     }
     fn bench(n_distinct: u64, crossed: bool) {
         let m = 300_000i64;
-        let mut events = vec![ev(1, DEPTH_EVENT | BUY_EVENT, 98.0, 1.0), ev(1, DEPTH_EVENT | SELL_EVENT, 102.0, 1.0), ev(3, 0, 0.0, 0.0), ev(4, 0, 0.0, 0.0), ev(5, 0, 0.0, 0.0)];
+        let mut events = vec![
+            ev(1, DEPTH_EVENT | BUY_EVENT, 98.0, 1.0),
+            ev(1, DEPTH_EVENT | SELL_EVENT, 102.0, 1.0),
+            ev(3, 0, 0.0, 0.0),
+            ev(4, 0, 0.0, 0.0),
+            ev(5, 0, 0.0, 0.0),
+        ];
         if crossed {
             // our 1000.0 sell at 100 gets crossed by a bid far above, leaving a big remainder resting crossed
             events.push(ev(6, DEPTH_EVENT | BUY_EVENT, 100.0 + 500.0, 0.01));
         }
         for i in 0..m {
-            events.push(ev(10 + i, DEPTH_EVENT | BUY_EVENT, 97.0 - (i % 50) as f64, 1.0 + (i % 7) as f64));
+            events.push(ev(
+                10 + i,
+                DEPTH_EVENT | BUY_EVENT,
+                97.0 - (i % 50) as f64,
+                1.0 + (i % 7) as f64,
+            ));
         }
         events.push(ev(10 + m + 1, 0, 0.0, 0.0));
         let asset = L2AssetBuilder::default()
@@ -1952,10 +2099,20 @@ mod ab3465_crossing_bench {
         let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
         bt.elapse(3).unwrap();
         for i in 0..n_distinct {
-            bt.submit_sell_order(0, i + 10, 200.0 + i as f64, 0.01, TimeInForce::GTX, OrdType::Limit, false).unwrap();
+            bt.submit_sell_order(
+                0,
+                i + 10,
+                200.0 + i as f64,
+                0.01,
+                TimeInForce::GTX,
+                OrdType::Limit,
+                false,
+            )
+            .unwrap();
         }
         if crossed {
-            bt.submit_sell_order(0, 1, 100.0, 1000.0, TimeInForce::GTX, OrdType::Limit, false).unwrap();
+            bt.submit_sell_order(0, 1, 100.0, 1000.0, TimeInForce::GTX, OrdType::Limit, false)
+                .unwrap();
         }
         bt.elapse(1).unwrap();
         for i in 0..n_distinct {
@@ -1964,7 +2121,14 @@ mod ab3465_crossing_bench {
         bt.elapse(1).unwrap();
         let t0 = std::time::Instant::now();
         bt.elapse(m + 100).unwrap();
-        println!("BENCH n_distinct={n_distinct} crossed={crossed}: {} bid events in {:?} pos={} ts={} open={}", m, t0.elapsed(), bt.position(0), bt.current_timestamp(), bt.orders(0).len());
+        println!(
+            "BENCH n_distinct={n_distinct} crossed={crossed}: {} bid events in {:?} pos={} ts={} open={}",
+            m,
+            t0.elapsed(),
+            bt.position(0),
+            bt.current_timestamp(),
+            bt.orders(0).len()
+        );
     }
     #[test]
     #[ignore]
@@ -1983,7 +2147,10 @@ mod ab3465_review3_cases {
             Backtest, DataSource, ExchangeKind, L2AssetBuilder,
             assettype::LinearAsset,
             data::Data,
-            models::{CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel, TradingValueFeeModel},
+            models::{
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
+                TradingValueFeeModel,
+            },
         },
         depth::HashMapMarketDepth,
         prelude::Bot,
@@ -1991,10 +2158,23 @@ mod ab3465_review3_cases {
     };
 
     fn ev(t: i64, e: u64, px: f64, qty: f64) -> Event {
-        Event { ev: e | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival: 0, fval: 0.0 }
+        Event {
+            ev: e | EXCH_EVENT | LOCAL_EVENT,
+            exch_ts: t,
+            local_ts: t,
+            px,
+            qty,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }
     }
-    fn bid(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | BUY_EVENT, px, q) }
-    fn ask(t: i64, px: f64, q: f64) -> Event { ev(t, DEPTH_EVENT | SELL_EVENT, px, q) }
+    fn bid(t: i64, px: f64, q: f64) -> Event {
+        ev(t, DEPTH_EVENT | BUY_EVENT, px, q)
+    }
+    fn ask(t: i64, px: f64, q: f64) -> Event {
+        ev(t, DEPTH_EVENT | SELL_EVENT, px, q)
+    }
 
     type O = (u64, bool, f64, f64, TimeInForce, i64);
 
@@ -2022,20 +2202,36 @@ mod ab3465_review3_cases {
         let mut os = orders.to_vec();
         os.sort_by_key(|o| o.5);
         for (id, b, px, q, tif, t) in os {
-            if t > now { bt.elapse(t - now).unwrap(); now = t; }
+            if t > now {
+                bt.elapse(t - now).unwrap();
+                now = t;
+            }
             if b {
-                bt.submit_buy_order(0, id, px, q, tif, OrdType::Limit, false).unwrap();
+                bt.submit_buy_order(0, id, px, q, tif, OrdType::Limit, false)
+                    .unwrap();
             } else {
-                bt.submit_sell_order(0, id, px, q, tif, OrdType::Limit, false).unwrap();
+                bt.submit_sell_order(0, id, px, q, tif, OrdType::Limit, false)
+                    .unwrap();
             }
         }
         bt.elapse(100 - now).unwrap();
         let open = bt.orders(0).values().filter(|o| o.active()).count();
-        for o in bt.orders(0).values() { println!("DBG id={} st={:?} leaves={:e} exec={:e} maker={}", o.order_id, o.status, o.leaves_qty, o.exec_qty, o.maker); }
-        println!("DBG pos={:e} n={}", bt.position(0), bt.state_values(0).num_trades);
+        for o in bt.orders(0).values() {
+            println!(
+                "DBG id={} st={:?} leaves={:e} exec={:e} maker={}",
+                o.order_id, o.status, o.leaves_qty, o.exec_qty, o.maker
+            );
+        }
+        println!(
+            "DBG pos={:e} n={}",
+            bt.position(0),
+            bt.state_values(0).num_trades
+        );
         (bt.position(0), open, bt.state_values(0).num_trades)
     }
-    fn near(a: f64, b: f64) -> bool { (a - b).abs() < 1e-9 }
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
 
     // F1: the crossing walk stops at our LEAST crossed order, so deeper levels that cross only our more aggressive
     // order are never visited.
@@ -2043,7 +2239,10 @@ mod ab3465_review3_cases {
     fn f1_walk_reaches_the_most_crossed_order() {
         let (p, _, _) = run(
             &[],
-            &[(1, false, 99.0, 1.0, TimeInForce::GTX, 3), (2, false, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[
+                (1, false, 99.0, 1.0, TimeInForce::GTX, 3),
+                (2, false, 100.0, 1.0, TimeInForce::GTX, 3),
+            ],
             &[bid(10, 101.0, 0.2), bid(11, 99.0, 0.5)],
             false,
         );
@@ -2054,7 +2253,10 @@ mod ab3465_review3_cases {
     fn f1b_buy_mirror() {
         let (p, _, _) = run(
             &[],
-            &[(1, true, 101.0, 1.0, TimeInForce::GTX, 3), (2, true, 100.0, 1.0, TimeInForce::GTX, 3)],
+            &[
+                (1, true, 101.0, 1.0, TimeInForce::GTX, 3),
+                (2, true, 100.0, 1.0, TimeInForce::GTX, 3),
+            ],
             &[ask(10, 99.0, 0.2), ask(11, 101.0, 0.5)],
             false,
         );
@@ -2066,12 +2268,18 @@ mod ab3465_review3_cases {
     fn f2_ioc_dust_fill_from_crossed_residue() {
         let (p, _, n) = run(
             &[],
-            &[(1, true, 100.0, 1.0, TimeInForce::GTX, 3), (2, true, 99.0, 0.5, TimeInForce::IOC, 20)],
+            &[
+                (1, true, 100.0, 1.0, TimeInForce::GTX, 3),
+                (2, true, 99.0, 0.5, TimeInForce::IOC, 20),
+            ],
             &[ask(10, 99.0, 0.05), ask(11, 99.0, 0.21)],
             false,
         );
         // maker takes 0.05 then 0.16 = all 0.21 displayed; the IOC finds nothing
-        assert!(near(p, 0.21) && n == 2, "pos={p} num_trades={n} (expected 2 maker fills, no IOC fill)");
+        assert!(
+            near(p, 0.21) && n == 2,
+            "pos={p} num_trades={n} (expected 2 maker fills, no IOC fill)"
+        );
     }
 
     // F3: Lighter live-book style resync: EXCH_DEPTH_CLEAR then plain depth events at the same ts
@@ -2134,8 +2342,15 @@ mod ab3465_review3_cases {
     fn f4_cancel_after_partial_and_trade() {
         let (p, open, _) = run(
             &[],
-            &[(1, false, 100.0, 1.0, TimeInForce::GTX, 3), (2, false, 100.0, 1.0, TimeInForce::GTX, 3)],
-            &[bid(10, 101.0, 0.5), bid(11, 101.0, 1.8), ev(12, TRADE_EVENT | BUY_EVENT, 103.0, 0.5)],
+            &[
+                (1, false, 100.0, 1.0, TimeInForce::GTX, 3),
+                (2, false, 100.0, 1.0, TimeInForce::GTX, 3),
+            ],
+            &[
+                bid(10, 101.0, 0.5),
+                bid(11, 101.0, 1.8),
+                ev(12, TRADE_EVENT | BUY_EVENT, 103.0, 0.5),
+            ],
             false,
         );
         assert!(near(p, -2.0) && open == 0, "got {p} open={open}");
@@ -2257,20 +2472,50 @@ mod ab3465_batch_dedup_exact {
     const LOT: f64 = 0.00001;
 
     fn event(t: i64, ev: u64, px: f64, qty: f64, ival: i64) -> Event {
-        Event { ev: ev | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival, fval: 0.0 }
+        Event {
+            ev: ev | EXCH_EVENT | LOCAL_EVENT,
+            exch_ts: t,
+            local_ts: t,
+            px,
+            qty,
+            order_id: 0,
+            ival,
+            fval: 0.0,
+        }
     }
 
     /// `ahead` rests at the ask 100 and our sells (`ours`, joining at t=3, 4, ...) queue behind it; at t=10 the
     /// level grows to `level`. Then the batch stamped 50: buy prints `prints` at t=40, 41, ... and the level changes
     /// to each of `changes` in turn, all before the prints (t=30, 31, ...) or all after them (t=45, 46, ...).
     /// Our position, and each order's executed quantity.
-    fn run(ahead: f64, ours: &[f64], level: f64, prints: &[f64], changes: &[f64], changes_first: bool) -> (f64, Vec<f64>) {
-        run_split(ahead, ours, level, prints, changes, if changes_first { changes.len() } else { 0 })
+    fn run(
+        ahead: f64,
+        ours: &[f64],
+        level: f64,
+        prints: &[f64],
+        changes: &[f64],
+        changes_first: bool,
+    ) -> (f64, Vec<f64>) {
+        run_split(
+            ahead,
+            ours,
+            level,
+            prints,
+            changes,
+            if changes_first { changes.len() } else { 0 },
+        )
     }
 
     /// As [`run`], with the first `before` changes ahead of the prints (t=30, 31, ...) and the rest after them
     /// (t=45, 46, ...): `before` 0 is print first.
-    fn run_split(ahead: f64, ours: &[f64], level: f64, prints: &[f64], changes: &[f64], before: usize) -> (f64, Vec<f64>) {
+    fn run_split(
+        ahead: f64,
+        ours: &[f64],
+        level: f64,
+        prints: &[f64],
+        changes: &[f64],
+        before: usize,
+    ) -> (f64, Vec<f64>) {
         let mut events = vec![
             event(1, DEPTH_EVENT | BUY_EVENT, 98.0, 1.0, 0),
             event(2, DEPTH_EVENT | SELL_EVENT, 100.0, ahead, 0),
@@ -2284,7 +2529,11 @@ mod ab3465_batch_dedup_exact {
             events.push(event(40 + i as i64, TRADE_EVENT | BUY_EVENT, 100.0, q, 0));
         }
         for (i, &q) in changes.iter().enumerate() {
-            let at = if i < before { 30 + i as i64 } else { 45 + i as i64 };
+            let at = if i < before {
+                30 + i as i64
+            } else {
+                45 + i as i64
+            };
             events.push(event(at, DEPTH_EVENT | SELL_EVENT, 100.0, q, STAMP));
         }
         events.sort_by_key(|e| e.exch_ts);
@@ -2302,14 +2551,26 @@ mod ab3465_batch_dedup_exact {
         let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
         bt.elapse(3).unwrap();
         for (i, &qty) in ours.iter().enumerate() {
-            bt.submit_sell_order(0, 1 + i as u64, 100.0, qty, TimeInForce::GTX, OrdType::Limit, false)
-                .unwrap();
+            bt.submit_sell_order(
+                0,
+                1 + i as u64,
+                100.0,
+                qty,
+                TimeInForce::GTX,
+                OrdType::Limit,
+                false,
+            )
+            .unwrap();
             bt.elapse(1).unwrap();
         }
         bt.elapse(60).unwrap();
         let orders = bt.orders(0);
         let executed = (0..ours.len())
-            .map(|i| orders.get(&(1 + i as u64)).map_or(ours[i], |o| o.exec_qty.max(ours[i] - o.leaves_qty)))
+            .map(|i| {
+                orders
+                    .get(&(1 + i as u64))
+                    .map_or(ours[i], |o| o.exec_qty.max(ours[i] - o.leaves_qty))
+            })
             .collect();
         (bt.position(0), executed)
     }
@@ -2325,7 +2586,10 @@ mod ab3465_batch_dedup_exact {
     fn a_print_that_reaches_our_order_fills_it_in_either_order() {
         let (print_first, _) = run(0.0004, &[0.001], 0.0014, &[0.0006], &[0.0008], false);
         let (depletion_first, _) = run(0.0004, &[0.001], 0.0014, &[0.0006], &[0.0008], true);
-        assert!(near(print_first, -0.0002), "print first fills 0.0002, got {print_first}");
+        assert!(
+            near(print_first, -0.0002),
+            "print first fills 0.0002, got {print_first}"
+        );
         assert_eq!(depletion_first, print_first);
     }
 
@@ -2335,7 +2599,10 @@ mod ab3465_batch_dedup_exact {
     fn several_prints_of_one_batch_fill_what_they_fill_print_first() {
         let (print_first, _) = run(0.0004, &[0.001], 0.0004, &[0.0006, 0.0003], &[0.0], false);
         let (depletion_first, _) = run(0.0004, &[0.001], 0.0004, &[0.0006, 0.0003], &[0.0], true);
-        assert!(near(print_first, -0.0005), "print first fills 0.0005, got {print_first}");
+        assert!(
+            near(print_first, -0.0005),
+            "print first fills 0.0005, got {print_first}"
+        );
         assert_eq!(depletion_first, print_first);
     }
 
@@ -2344,7 +2611,14 @@ mod ab3465_batch_dedup_exact {
     #[test]
     fn no_phantom_fill_with_two_orders_and_two_changes() {
         for first in [false, true] {
-            let (position, _) = run(0.001, &[0.001, 0.0005], 0.002, &[0.0006], &[0.0016, 0.0014], first);
+            let (position, _) = run(
+                0.001,
+                &[0.001, 0.0005],
+                0.002,
+                &[0.0006],
+                &[0.0016, 0.0014],
+                first,
+            );
             assert_eq!(position, 0.0, "changes first: {first}");
         }
     }
@@ -2356,15 +2630,21 @@ mod ab3465_batch_dedup_exact {
     fn depletion_first_equals_print_first_bit_for_bit() {
         let mut seed: u64 = 0x3465;
         let mut next = |n: u64| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) % n
         };
         let mut reached = 0;
         for _ in 0..3000 {
             let ahead = next(300) as f64 * LOT;
             let level = ahead + next(300) as f64 * LOT;
-            let ours: Vec<f64> = (0..1 + next(2)).map(|_| (1 + next(150)) as f64 * LOT).collect();
-            let prints: Vec<f64> = (0..1 + next(3)).map(|_| (1 + next(400)) as f64 * LOT).collect();
+            let ours: Vec<f64> = (0..1 + next(2))
+                .map(|_| (1 + next(150)) as f64 * LOT)
+                .collect();
+            let prints: Vec<f64> = (0..1 + next(3))
+                .map(|_| (1 + next(400)) as f64 * LOT)
+                .collect();
             let changes: Vec<f64> = (0..1 + next(3)).map(|_| next(700) as f64 * LOT).collect();
             // Any number of the batch's changes (a level touched up to three times in one stamp) ahead of the
             // prints: all of them, or only some, with the rest after.
@@ -2379,7 +2659,10 @@ mod ab3465_batch_dedup_exact {
                 reached += 1;
             }
         }
-        assert!(reached > 300, "the prints reach our orders in many cases ({reached})");
+        assert!(
+            reached > 300,
+            "the prints reach our orders in many cases ({reached})"
+        );
     }
 }
 
@@ -2406,7 +2689,16 @@ mod ab3465_batch_dedup_join_mid_batch {
     const LOT: f64 = 0.00001;
 
     fn event(t: i64, ev: u64, px: f64, qty: f64, ival: i64) -> Event {
-        Event { ev: ev | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival, fval: 0.0 }
+        Event {
+            ev: ev | EXCH_EVENT | LOCAL_EVENT,
+            exch_ts: t,
+            local_ts: t,
+            px,
+            qty,
+            order_id: 0,
+            ival,
+            fval: 0.0,
+        }
     }
 
     /// `level` rests at the ask 100; our `ours` sell joins at t=25. Batch stamped 50: the buy prints `prints` (t=40,
@@ -2424,9 +2716,21 @@ mod ab3465_batch_dedup_join_mid_batch {
             events.push(event(40 + i as i64, TRADE_EVENT | BUY_EVENT, 100.0, q, 0));
         }
         let (first, rest) = if depletion_first { (20, 30) } else { (45, 46) };
-        events.push(event(first, DEPTH_EVENT | SELL_EVENT, 100.0, depleted, STAMP));
+        events.push(event(
+            first,
+            DEPTH_EVENT | SELL_EVENT,
+            100.0,
+            depleted,
+            STAMP,
+        ));
         for (i, &q) in more.iter().enumerate() {
-            events.push(event(rest + i as i64, DEPTH_EVENT | SELL_EVENT, 100.0, q, STAMP));
+            events.push(event(
+                rest + i as i64,
+                DEPTH_EVENT | SELL_EVENT,
+                100.0,
+                q,
+                STAMP,
+            ));
         }
         events.sort_by_key(|e| e.exch_ts);
         events.push(event(60, 0, 0.0, 0.0, 0));
@@ -2452,9 +2756,18 @@ mod ab3465_batch_dedup_join_mid_batch {
     /// the batch refills to 0.0009, then the print. The earlier fix replayed the whole print on a queue that already
     /// excluded it: a 0.0002 phantom fill.
     #[test]
-    fn an_order_joining_between_two_changes_of_a_batch_is_not_filled_by_the_already_depleted_print() {
-        assert_eq!(run(0.001, 0.001, &[0.0006], &[0.0009], false), 0.0, "print first");
-        assert_eq!(run(0.001, 0.001, &[0.0006], &[0.0009], true), 0.0, "depletion first");
+    fn an_order_joining_between_two_changes_of_a_batch_is_not_filled_by_the_already_depleted_print()
+    {
+        assert_eq!(
+            run(0.001, 0.001, &[0.0006], &[0.0009], false),
+            0.0,
+            "print first"
+        );
+        assert_eq!(
+            run(0.001, 0.001, &[0.0006], &[0.0009], true),
+            0.0,
+            "depletion first"
+        );
     }
 
     /// Random batches: the level, our size, one to three prints (together possibly more than the level, which then
@@ -2463,14 +2776,18 @@ mod ab3465_batch_dedup_join_mid_batch {
     fn joining_mid_batch_fills_what_print_first_fills() {
         let mut seed: u64 = 0x3465_0002;
         let mut next = |n: u64| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) % n
         };
         let mut reached = 0;
         for _ in 0..3000 {
             let level = next(300) as f64 * LOT;
             let ours = (1 + next(150)) as f64 * LOT;
-            let prints: Vec<f64> = (0..1 + next(3)).map(|_| (1 + next(250)) as f64 * LOT).collect();
+            let prints: Vec<f64> = (0..1 + next(3))
+                .map(|_| (1 + next(250)) as f64 * LOT)
+                .collect();
             let more: Vec<f64> = (0..next(4)).map(|_| next(700) as f64 * LOT).collect();
             let print_first = run(level, ours, &prints, &more, false);
             let depletion_first = run(level, ours, &prints, &more, true);
@@ -2482,7 +2799,10 @@ mod ab3465_batch_dedup_join_mid_batch {
                 reached += 1;
             }
         }
-        assert!(reached > 300, "the prints reach our order in many cases ({reached})");
+        assert!(
+            reached > 300,
+            "the prints reach our order in many cases ({reached})"
+        );
     }
 }
 
@@ -2507,7 +2827,16 @@ mod ab3465_batch_depletion_receipt_clock {
     };
 
     fn event(t: i64, ev: u64, px: f64, qty: f64, ival: i64) -> Event {
-        Event { ev: ev | EXCH_EVENT | LOCAL_EVENT, exch_ts: t, local_ts: t, px, qty, order_id: 0, ival, fval: 0.0 }
+        Event {
+            ev: ev | EXCH_EVENT | LOCAL_EVENT,
+            exch_ts: t,
+            local_ts: t,
+            px,
+            qty,
+            order_id: 0,
+            ival,
+            fval: 0.0,
+        }
     }
 
     /// Receipt order: the batch sent at 50 arrives at 52, the 0.0006 print executed at 49 arrives at 53.
@@ -2545,6 +2874,9 @@ mod ab3465_batch_depletion_receipt_clock {
 
     #[test]
     fn without_its_own_time_the_receipt_clock_cannot_tell() {
-        assert!(position(0) < 0.0, "matched at receipt 53 after the batch stamped 50: no de-duplication");
+        assert!(
+            position(0) < 0.0,
+            "matched at receipt 53 after the batch stamped 50: no de-duplication"
+        );
     }
 }
